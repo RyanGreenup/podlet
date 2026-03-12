@@ -739,4 +739,60 @@ services:
         );
         assert_eq!(stop, vec!["podman exec systemd-%N pg_ctl stop -m fast"]);
     }
+
+    #[test]
+    fn extract_hooks_multiple_entries_all_collected() {
+        let yaml = r#"
+services:
+  app:
+    image: example
+    post_start:
+      - command: ["step1"]
+      - command: ["step2", "--flag"]
+    pre_stop:
+      - command: ["cleanup1"]
+      - command: ["cleanup2", "--force"]
+"#;
+        let mut value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let hooks = extract_lifecycle_hooks(&mut value).unwrap();
+        let app_hooks = hooks.get("app").unwrap();
+        assert_eq!(
+            app_hooks.post_start,
+            vec![vec!["step1"], vec!["step2", "--flag"]]
+        );
+        assert_eq!(
+            app_hooks.pre_stop,
+            vec![vec!["cleanup1"], vec!["cleanup2", "--force"]]
+        );
+    }
+
+    #[test]
+    fn extract_hooks_no_services_key_returns_empty() {
+        let yaml = r#"
+version: "3"
+networks:
+  default:
+"#;
+        let mut value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let hooks = extract_lifecycle_hooks(&mut value).unwrap();
+        assert!(hooks.is_empty());
+    }
+
+    #[test]
+    fn to_service_fields_quotes_args_with_spaces_and_special_chars() {
+        let hooks = LifecycleHooks {
+            post_start: vec![vec![
+                "echo".into(),
+                "hello world".into(),
+                "it's alive".into(),
+            ]],
+            pre_stop: vec![],
+        };
+        let (start_post, _stop) = hooks.to_service_fields();
+        // shlex quotes args with spaces and uses double-quotes when the arg contains an apostrophe
+        assert_eq!(
+            start_post,
+            vec!["podman exec systemd-%N echo 'hello world' \"it's alive\""]
+        );
+    }
 }
