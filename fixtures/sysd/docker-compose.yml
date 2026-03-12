@@ -1,0 +1,44 @@
+name: sysd-postgres
+services:
+  postgres:
+    image: docker.io/library/postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: example
+    volumes:
+      - pg_data:/var/lib/postgresql/data:Z
+
+    # --- Lifecycle hooks (compose spec 2024, not yet in compose_spec crate 0.3.0) ---
+    # Silently ignored by podlet; use ExecStartPost= / ExecStopPre= in a systemd drop-in instead.
+    post_start:
+      - command: ["pg_isready", "-U", "postgres"]
+    pre_stop:
+      - command: ["pg_ctl", "stop", "-m", "fast"]
+
+    # --- Resource limits ---
+    # mem_limit → Memory= in [Container]
+    mem_limit: 512m
+    # pids_limit → PidsLimit= in [Container]
+    pids_limit: 100
+
+    # --- PodmanArgs= resource fields ---
+    # mem_reservation: soft memory limit (--memory-reservation)
+    mem_reservation: 128m
+    # mem_swappiness: 0–100, 0 = prefer not to swap (--memory-swappiness)
+    mem_swappiness: 0
+    # oom_score_adj: -1000–1000, negative = less likely to be OOM-killed (--oom-score-adj)
+    oom_score_adj: -500
+
+    # cpu_shares: relative weight vs other containers, default 1024 (--cpu-shares)
+    cpu_shares: 512
+    # cpus: hard cap on CPU usage as a fraction of one core (--cpus)
+    cpus: 2.0
+    # cpu_period / cpu_quota: together set the CFS bandwidth; quota/period = fraction of CPUs
+    # e.g. 50000us quota / 100000us period = 0.5 CPUs (same as cpus: 0.5 but explicit)
+    cpu_period: 100000
+    cpu_quota: 200000
+    # cpuset: pin to specific CPU cores (--cpuset-cpus)
+    cpuset: "0-3"
+
+volumes:
+  pg_data:

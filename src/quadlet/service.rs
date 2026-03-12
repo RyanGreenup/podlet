@@ -12,14 +12,28 @@ pub struct Service {
     /// Configure if and when the service should be restarted.
     #[arg(long, value_name = "POLICY")]
     pub restart: Option<RestartConfig>,
+
+    /// Commands to run after the main container process starts.
+    #[arg(skip)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exec_start_post: Vec<String>,
+
+    /// Commands to run to stop the service.
+    #[arg(skip)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exec_stop: Vec<String>,
 }
 
 impl Service {
     /// Returns `true` if all fields are [`None`].
     pub fn is_empty(&self) -> bool {
-        let Self { restart } = self;
+        let Self {
+            restart,
+            exec_start_post,
+            exec_stop,
+        } = self;
 
-        restart.is_none()
+        restart.is_none() && exec_start_post.is_empty() && exec_stop.is_empty()
     }
 }
 
@@ -27,6 +41,7 @@ impl From<RestartConfig> for Service {
     fn from(restart: RestartConfig) -> Self {
         Self {
             restart: Some(restart),
+            ..Self::default()
         }
     }
 }
