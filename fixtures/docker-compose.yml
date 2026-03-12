@@ -1,0 +1,171 @@
+name: postgres-podman-example
+services:
+  postgres:
+    image: docker.io/library/postgres:17
+    restart: unless-stopped
+    # No network — postgres is only reachable via the shared unix socket
+    network_mode: "none"
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+      - pgcat_password
+    volumes:
+      - pg_data:/var/lib/postgresql/data:Z # :Z private — only postgres owns its data
+      - pg_socket:/var/run/postgresql:z # :z shared — pgbouncer also needs access
+      - ./initdb.d:/docker-entrypoint-initdb.d:Z # :Z private — only postgres runs init scripts
+    user: postgres
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges
+    cap_drop:
+      - ALL
+    cpus: 4.0
+    mem_limit: 1g
+    mem_reservation: 256m
+    pids_limit: 100
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pgbouncer:
+    image: docker.io/edoburu/pgbouncer:v1.24.0-p0
+    restart: unless-stopped
+    user: postgres
+    entrypoint: ["/entrypoint.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # App network only — pgbouncer provides database access to application containers
+    networks:
+      - app
+    secrets:
+      - pgcat_password
+    volumes:
+      - pg_socket:/var/run/postgresql:z # :z shared with postgres
+      - pgbouncer_socket:/tmp/pgbouncer:Z # :Z private — only pgbouncer exposes this socket
+      - ./config/pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:Z,ro
+      - ./config/pgbouncer/entrypoint.sh:/entrypoint.sh:Z,ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges
+    cap_drop:
+      - ALL
+    cpus: 2.0
+    mem_limit: 256m
+    mem_reservation: 64m
+    pids_limit: 50
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 6432"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  prometheus:
+    image: docker.io/prom/prometheus:v3.2.0
+    restart: unless-stopped
+    networks:
+      - monitoring
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:Z,ro
+      - prometheus_data:/prometheus:Z
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges
+    cap_drop:
+      - ALL
+    cpus: 1.0
+    mem_limit: 512m
+    mem_reservation: 128m
+    pids_limit: 50
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  grafana:
+    image: docker.io/grafana/grafana:11.5
+    restart: unless-stopped
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    networks:
+      - monitoring
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana:Z
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges
+    cap_drop:
+      - ALL
+    cpus: 1.0
+    mem_limit: 256m
+    mem_reservation: 64m
+    pids_limit: 50
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  clickhouse:
+      image: clickhouse:26.2
+      # WARNING: Exposing the database port will make it accessible from outside the container,
+      # potentially allowing unauthorized access. If you uncomment the ports below,
+      # ensure to secure your database (e.g., with strong authentication, proper network rules, and firewalls).
+      # ports:
+      #   - 8123:8123 # http api
+      #   - 9000:9000 # native
+      environment:
+        # default settings
+        CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+      volumes:
+        - ./docker/clickhouse/local/config.xml:/etc/clickhouse-server/config.xml
+        - ./docker/clickhouse/local/users.xml:/etc/clickhouse-server/users.xml
+        - ./.volumes/ch_data:/var/lib/clickhouse
+        - ./.volumes/ch_logs:/var/log/clickhouse-server
+      restart: on-failure
+      networks:
+        - internal
+
+
+
+
+
+
+volumes:
+  pg_data:
+  pg_socket:
+  pgbouncer_socket:
+  prometheus_data:
+  grafana_data:
+
+secrets:
+  postgres_password:
+    external: true
+  pgcat_password:
+    external: true
+
+networks:
+  # Internal bridge between pgbouncer and backend services only.
+  # Never expose pgbouncer directly — frontends must use a separate network
+  # and reach the database through the backend app.
+  app:
+    internal: true
+  monitoring:
+    internal: true
+  internal:
+    internal: true

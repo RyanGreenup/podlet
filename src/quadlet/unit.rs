@@ -115,9 +115,14 @@ impl Unit {
 
     /// Add a compose [`Service`](compose_spec::Service) [`Dependency`] to the unit.
     ///
+    /// Returns `true` if the dependency has a [`ServiceHealthy`](Condition::ServiceHealthy)
+    /// condition, meaning the dependency's container should have `Notify=healthy` set so that
+    /// systemd waits for a healthy healthcheck before considering it started.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the [`Condition`] is not [`ServiceStarted`](Condition::ServiceStarted)
+    /// Returns an error if the [`Condition`] is
+    /// [`ServiceCompletedSuccessfully`](Condition::ServiceCompletedSuccessfully)
     /// or the [`Dependency`] is set to `restart` but is not `required`.
     pub fn add_dependency(
         &mut self,
@@ -127,16 +132,18 @@ impl Unit {
             restart,
             required,
         }: Dependency,
-    ) -> eyre::Result<()> {
-        match condition {
-            Condition::ServiceStarted => {}
-            Condition::ServiceHealthy => {
-                return Err(condition_eyre(condition, "Notify=healthy", "Container"));
-            }
+    ) -> eyre::Result<bool> {
+        // `service_healthy` is handled the same as `service_started` for systemd ordering
+        // (After= + Requires=/Wants=/BindsTo=). The actual "wait for healthy" behavior is
+        // achieved by setting `Notify=healthy` on the *dependency's* container, which the
+        // caller is responsible for based on the returned bool.
+        let needs_healthy = match condition {
+            Condition::ServiceStarted => false,
+            Condition::ServiceHealthy => true,
             Condition::ServiceCompletedSuccessfully => {
                 return Err(condition_eyre(condition, "Type=oneshot", "Service"));
             }
-        }
+        };
 
         // Which list to add the dependency to depends on whether to restart this unit and if the
         // dependency is required.
@@ -153,7 +160,7 @@ impl Unit {
         list.push(name.clone());
         self.after.push(name);
 
-        Ok(())
+        Ok(needs_healthy)
     }
 }
 

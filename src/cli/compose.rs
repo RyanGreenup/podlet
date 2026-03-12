@@ -1,8 +1,8 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{self, IsTerminal},
-    iter, mem,
+    mem,
     path::{Path, PathBuf},
 };
 
@@ -265,17 +265,37 @@ fn parts_try_into_files(
         .collect();
 
     let mut pod_ports = Vec::new();
-    let mut files = services_try_into_quadlet_files(
+    let (service_files, healthy_dependencies) = services_try_into_quadlet_files(
         services,
         &sections,
         &volume_has_options,
         pod_name.as_deref(),
         &mut pod_ports,
-    )
-    .chain(networks_try_into_quadlet_files(networks, &sections))
-    .chain(volumes_try_into_quadlet_files(volumes, &sections))
-    .map(|result| result.map(Into::into))
-    .collect::<Result<Vec<File>, _>>()?;
+    )?;
+
+    let mut files: Vec<File> = service_files.into_iter().map(File::from).collect();
+    files.extend(
+        networks_try_into_quadlet_files(networks, &sections)
+            .chain(volumes_try_into_quadlet_files(volumes, &sections))
+            .map(|result| result.map(Into::into))
+            .collect::<Result<Vec<File>, _>>()?,
+    );
+
+    // Post-pass: for any service depended on with `condition: service_healthy`, set
+    // `Notify=healthy` on its container. This tells systemd to wait for the container's
+    // healthcheck to pass before considering the service started, which is the Quadlet
+    // equivalent of compose's `service_healthy` dependency condition.
+    if !healthy_dependencies.is_empty() {
+        for file in &mut files {
+            if let File::Quadlet(quadlet_file) = file {
+                if healthy_dependencies.contains(&quadlet_file.name) {
+                    if let quadlet::Resource::Container(container) = &mut quadlet_file.resource {
+                        container.notify = quadlet::container::Notify::Healthy;
+                    }
+                }
+            }
+        }
+    }
 
     if let Some(name) = pod_name {
         let GenericSections {
@@ -317,26 +337,33 @@ fn parts_try_into_files(
 /// [`Dependency`](compose_spec::service::Dependency) to the [`Unit`], converting the
 /// [`Build`](compose_spec::service::Build) section into a [`quadlet::Build`] file, or converting
 /// the [`Service`] into a [`quadlet::Container`] file.
-fn services_try_into_quadlet_files<'a>(
+/// Returns a list of [`quadlet::File`]s and a [`HashSet`] of service names that need
+/// `Notify=healthy` set on their containers.
+fn services_try_into_quadlet_files(
     services: IndexMap<Identifier, Service>,
     sections @ GenericSections {
         unit,
         quadlet,
         install,
-    }: &'a GenericSections,
-    volume_has_options: &'a HashMap<Identifier, bool>,
-    pod_name: Option<&'a str>,
-    pod_ports: &'a mut Vec<String>,
-) -> impl Iterator<Item = color_eyre::Result<quadlet::File>> + 'a {
-    services.into_iter().flat_map(move |(name, mut service)| {
-        if service.image.is_some() && service.build.is_some() {
-            return iter::once(Err(eyre!(
-                "error converting service `{name}`: `image` and `build` cannot both be set"
-            )))
-            .chain(None);
-        }
+    }: &GenericSections,
+    volume_has_options: &HashMap<Identifier, bool>,
+    pod_name: Option<&str>,
+    pod_ports: &mut Vec<String>,
+) -> color_eyre::Result<(Vec<quadlet::File>, HashSet<String>)> {
+    let mut files = Vec::new();
+    let mut healthy_dependencies = HashSet::new();
 
-        let build = service.build.take().map(|build| {
+    for (name, mut service) in services {
+        ensure!(
+            service.image.is_some() || service.build.is_some(),
+            "error converting service `{name}`: neither `image` nor `build` is set",
+        );
+        ensure!(
+            service.image.is_none() || service.build.is_none(),
+            "error converting service `{name}`: `image` and `build` cannot both be set",
+        );
+
+        if let Some(build) = service.build.take() {
             let build = Build::try_from(build.into_long()).wrap_err_with(|| {
                 format!(
                     "error converting `build` for service `{name}` into a Quadlet `.build` file"
@@ -344,7 +371,7 @@ fn services_try_into_quadlet_files<'a>(
             })?;
             let image = format!("{}.build", build.name()).try_into()?;
             service.image = Some(image);
-            Ok(quadlet::File {
+            files.push(quadlet::File {
                 name: build.name().to_owned(),
                 unit: unit.clone(),
                 resource: build.into(),
@@ -352,23 +379,22 @@ fn services_try_into_quadlet_files<'a>(
                 quadlet: *quadlet,
                 service: quadlet::Service::default(),
                 install: install.clone(),
-            })
-        });
-        if let Some(result @ Err(_)) = build {
-            return iter::once(result).chain(None);
+            });
         }
 
-        let container = service_try_into_quadlet_file(
+        let (file, healthy) = service_try_into_quadlet_file(
             service,
             name,
             sections.clone(),
             volume_has_options,
             pod_name,
             pod_ports,
-        );
+        )?;
+        files.push(file);
+        healthy_dependencies.extend(healthy);
+    }
 
-        iter::once(container).chain(build)
-    })
+    Ok((files, healthy_dependencies))
 }
 
 /// Attempt to convert a compose [`Service`] into a [`quadlet::File`].
@@ -385,6 +411,9 @@ fn services_try_into_quadlet_files<'a>(
 /// Returns an error if there was an error [adding](Unit::add_dependency()) a service
 /// [`Dependency`](compose_spec::service::Dependency) to the [`Unit`] or converting the [`Service`]
 /// into a [`quadlet::Container`].
+/// The returned [`HashSet`] contains the names of dependency services that need `Notify=healthy`
+/// set on their containers. This is used to implement the compose `service_healthy` condition:
+/// systemd will wait for the dependency's healthcheck to pass before starting this service.
 fn service_try_into_quadlet_file(
     mut service: Service,
     name: Identifier,
@@ -396,21 +425,25 @@ fn service_try_into_quadlet_file(
     volume_has_options: &HashMap<Identifier, bool>,
     pod_name: Option<&str>,
     pod_ports: &mut Vec<String>,
-) -> color_eyre::Result<quadlet::File> {
+) -> color_eyre::Result<(quadlet::File, HashSet<String>)> {
+    let mut healthy_dependencies = HashSet::new();
+
     // Add any service dependencies to the [Unit] section of the Quadlet file.
     let dependencies = mem::take(&mut service.depends_on).into_long();
     if !dependencies.is_empty() {
         for (ident, dependency) in dependencies {
-            unit.add_dependency(
-                pod_name.map_or_else(
-                    || ident.to_string(),
-                    |pod_name| format!("{pod_name}-{ident}"),
-                ),
-                dependency,
-            )
-            .wrap_err_with(|| {
-                format!("error adding dependency on `{ident}` to service `{name}`")
-            })?;
+            let dep_name = pod_name.map_or_else(
+                || ident.to_string(),
+                |pod_name| format!("{pod_name}-{ident}"),
+            );
+            let needs_healthy = unit
+                .add_dependency(dep_name.clone(), dependency)
+                .wrap_err_with(|| {
+                    format!("error adding dependency on `{ident}` to service `{name}`")
+                })?;
+            if needs_healthy {
+                healthy_dependencies.insert(dep_name);
+            }
         }
     }
 
@@ -445,15 +478,18 @@ fn service_try_into_quadlet_file(
         name.into()
     };
 
-    Ok(quadlet::File {
-        name,
-        unit,
-        resource: container.into(),
-        globals: global_args.into(),
-        quadlet,
-        service: restart.map(Into::into).unwrap_or_default(),
-        install,
-    })
+    Ok((
+        quadlet::File {
+            name,
+            unit,
+            resource: container.into(),
+            globals: global_args.into(),
+            quadlet,
+            service: restart.map(Into::into).unwrap_or_default(),
+            install,
+        },
+        healthy_dependencies,
+    ))
 }
 
 /// Attempt to convert compose [`Networks`] into an [`Iterator`] of [`quadlet::File`]s.
