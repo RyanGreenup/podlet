@@ -4,6 +4,7 @@ use std::{
     io::{self, IsTerminal},
     mem,
     path::{Path, PathBuf},
+    process,
 };
 
 use clap::Args;
@@ -232,6 +233,21 @@ pub struct Compose {
     /// Set to `/dev/null` or an empty path to disable env file loading.
     #[arg(long, value_name = "PATH")]
     pub env_file: Option<PathBuf>,
+
+    /// Create a Podman secret from the env file with this name.
+    ///
+    /// If a secret with this name already exists, a numeric suffix is
+    /// appended (-1, -2, …). Use `--replace-secret` to overwrite instead.
+    ///
+    /// Requires an env file (explicit `--env-file` or an auto-discovered `.env`).
+    #[arg(long, value_name = "NAME")]
+    pub create_secret: Option<String>,
+
+    /// Replace an existing Podman secret instead of generating a new suffixed name.
+    ///
+    /// Only valid with `--create-secret`.
+    #[arg(long, requires = "create_secret")]
+    pub replace_secret: bool,
 }
 
 impl Compose {
@@ -250,12 +266,25 @@ impl Compose {
             kube,
             compose_file,
             env_file,
+            create_secret,
+            replace_secret,
         } = self;
 
         let mut options = compose_spec::Compose::options();
         options.apply_merge(true);
         let env = load_env(env_file.as_deref(), compose_file.as_deref())
             .wrap_err("error loading env file")?;
+
+        if let Some(requested_name) = &create_secret {
+            let dotenv_path = resolve_dotenv_path(env_file.as_deref(), compose_file.as_deref())
+                .wrap_err("error resolving env file path")?
+                .ok_or_eyre("--create-secret requires an env file, but none was found")?;
+            let actual_name = effective_secret_name(requested_name, replace_secret)
+                .wrap_err("error determining secret name")?;
+            run_secret_create(&actual_name, &dotenv_path, replace_secret)
+                .wrap_err("error creating Podman secret")?;
+            eprintln!("Created Podman secret: {actual_name}");
+        }
         let (compose, lifecycle_hooks) =
             read_from_file_or_stdin(compose_file.as_deref(), &options, &env)
                 .wrap_err("error reading compose file")?;
@@ -423,6 +452,35 @@ fn read_from_stdin(
     parse_compose(stdin, options, "stdin", env)
 }
 
+/// Resolve the dotenv file path without reading it.
+///
+/// - Explicit `env_file`: return it as-is (error if it doesn't exist).
+/// - Auto-discovery: `<compose_dir>/.env` if it exists, otherwise `None`.
+fn resolve_dotenv_path(
+    env_file: Option<&Path>,
+    compose_file: Option<&Path>,
+) -> color_eyre::Result<Option<PathBuf>> {
+    if let Some(path) = env_file {
+        ensure!(
+            path.exists(),
+            "env file `{}` does not exist",
+            path.display()
+        );
+        return Ok(Some(path.to_owned()));
+    }
+
+    let candidate = compose_file
+        .and_then(|p| p.parent())
+        .unwrap_or(Path::new("."))
+        .join(".env");
+
+    if candidate.exists() {
+        Ok(Some(candidate))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Load environment variables for compose interpolation.
 ///
 /// If `env_file` is `Some`, parse that file (error if not found).
@@ -434,18 +492,10 @@ fn load_env(
 ) -> color_eyre::Result<HashMap<String, String>> {
     let mut env: HashMap<String, String> = HashMap::new();
 
-    if let Some(path) = env_file {
-        let content = fs::read_to_string(path)
+    if let Some(path) = resolve_dotenv_path(env_file, compose_file)? {
+        let content = fs::read_to_string(&path)
             .wrap_err_with(|| format!("could not read env file `{}`", path.display()))?;
         env = parse_dotenv(&content);
-    } else {
-        let dotenv_path = compose_file
-            .and_then(|p| p.parent())
-            .unwrap_or(Path::new("."))
-            .join(".env");
-        if let Ok(content) = fs::read_to_string(&dotenv_path) {
-            env = parse_dotenv(&content);
-        }
     }
 
     // Process environment takes precedence
@@ -454,6 +504,52 @@ fn load_env(
     }
 
     Ok(env)
+}
+
+/// Check whether a Podman secret with `name` already exists.
+fn secret_exists(name: &str) -> color_eyre::Result<bool> {
+    let status = process::Command::new("podman")
+        .args(["secret", "inspect", "--format", "{{.ID}}", name])
+        .stdout(process::Stdio::null())
+        .stderr(process::Stdio::null())
+        .status()
+        .wrap_err_with(|| format!("error running `podman secret inspect {name}`"))
+        .note("ensure Podman is installed and available on $PATH")?;
+    Ok(status.success())
+}
+
+/// Run `podman secret create [--replace] <name> <file>`.
+fn run_secret_create(name: &str, file: &Path, replace: bool) -> color_eyre::Result<()> {
+    let mut cmd = process::Command::new("podman");
+    cmd.arg("secret").arg("create");
+    if replace {
+        cmd.arg("--replace");
+    }
+    cmd.arg(name).arg(file);
+    let status = cmd
+        .status()
+        .wrap_err_with(|| format!("error running `podman secret create {name}`"))
+        .note("ensure Podman is installed and available on $PATH")?;
+    ensure!(status.success(), "`podman secret create {name}` failed");
+    Ok(())
+}
+
+/// Return the name to use for the new secret, appending a numeric suffix if
+/// `requested` already exists (unless `replace` is true).
+fn effective_secret_name(requested: &str, replace: bool) -> color_eyre::Result<String> {
+    if replace {
+        return Ok(requested.to_owned());
+    }
+    if !secret_exists(requested)? {
+        return Ok(requested.to_owned());
+    }
+    for i in 1u32..=100 {
+        let candidate = format!("{requested}-{i}");
+        if !secret_exists(&candidate)? {
+            return Ok(candidate);
+        }
+    }
+    bail!("could not find a free secret name for `{requested}` after 100 attempts")
 }
 
 /// Parse a `.env` file into a map of key-value pairs.
@@ -1313,6 +1409,39 @@ services:
                 !deploy_map.contains_key(&serde_yaml::Value::String("rollback_config".into())),
                 "rollback_config should have been stripped",
             );
+        }
+    }
+
+    /// `effective_secret_name` with `replace=true` should return the requested name immediately
+    /// without calling `secret_exists` (which would shell out to podman).
+    #[test]
+    fn effective_secret_name_replace() {
+        // When replace=true the function returns the name as-is regardless of existence.
+        // We pass a name that would never exist so if the function incorrectly calls
+        // secret_exists it would try to invoke podman (which may or may not be available).
+        // The replace branch must short-circuit before any such call.
+        let result = effective_secret_name("my-secret", true).unwrap();
+        assert_eq!(result, "my-secret");
+    }
+
+    /// `effective_secret_name` with `replace=false` and a name that provably doesn't exist
+    /// (random UUID-like string) should return the name unchanged.
+    #[test]
+    fn effective_secret_name_no_conflict() {
+        // Use a name that is astronomically unlikely to collide with any real secret.
+        let name = "podlet-test-secret-zzz-nonexistent-xkcd";
+        // This test requires podman to be available; skip gracefully if it isn't.
+        let result = effective_secret_name(name, false);
+        match result {
+            Ok(actual) => assert_eq!(actual, name),
+            Err(e) => {
+                let msg = format!("{e:?}");
+                if msg.contains("ensure Podman is installed") || msg.contains("No such file") {
+                    // podman not available in this environment — that's OK
+                } else {
+                    panic!("unexpected error: {e:?}");
+                }
+            }
         }
     }
 }
