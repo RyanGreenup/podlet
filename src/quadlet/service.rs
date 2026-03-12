@@ -77,3 +77,36 @@ impl From<Restart> for RestartConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_with_hooks_serializes() -> Result<(), crate::serde::quadlet::Error> {
+        let service = Service {
+            exec_start_post: vec!["podman exec systemd-%N pg_isready -U postgres".into()],
+            exec_stop: vec!["podman exec systemd-%N pg_ctl stop -m fast".into()],
+            ..Service::default()
+        };
+        assert_eq!(
+            crate::serde::quadlet::to_string_join_all(service)?,
+            "[Service]\nExecStartPost=podman exec systemd-%N pg_isready -U postgres\nExecStop=podman exec systemd-%N pg_ctl stop -m fast\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_service_is_empty() {
+        assert!(Service::default().is_empty());
+    }
+
+    #[test]
+    fn service_with_exec_start_post_not_empty() {
+        let service = Service {
+            exec_start_post: vec!["cmd".into()],
+            ..Service::default()
+        };
+        assert!(!service.is_empty());
+    }
+}

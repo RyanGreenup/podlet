@@ -38,15 +38,17 @@ struct LifecycleHooks {
 impl LifecycleHooks {
     /// Convert lifecycle hooks into systemd `ExecStartPost=` and `ExecStop=` commands.
     ///
-    /// Each command is wrapped with `podman exec %n` so it runs inside the container.
-    fn into_service_fields(self) -> (Vec<String>, Vec<String>) {
-        let to_exec = |cmd: Vec<String>| {
+    /// Each command is wrapped with `podman exec systemd-%N` so it runs inside the container.
+    /// `%N` is the systemd unit-name specifier (without type suffix), matching the default
+    /// quadlet container name of `systemd-%N` (see `ContainerName=` in podman-systemd.unit(5)).
+    fn to_service_fields(&self) -> (Vec<String>, Vec<String>) {
+        let to_exec = |cmd: &Vec<String>| {
             let args = shlex::try_join(cmd.iter().map(String::as_str))
                 .unwrap_or_else(|_| cmd.join(" "));
-            format!("podman exec %n {args}")
+            format!("podman exec systemd-%N {args}")
         };
-        let exec_start_post = self.post_start.into_iter().map(&to_exec).collect();
-        let exec_stop = self.pre_stop.into_iter().map(to_exec).collect();
+        let exec_start_post = self.post_start.iter().map(&to_exec).collect();
+        let exec_stop = self.pre_stop.iter().map(to_exec).collect();
         (exec_start_post, exec_stop)
     }
 }
@@ -57,11 +59,11 @@ impl LifecycleHooks {
 /// deserialization. Returns a map of service name to hooks.
 fn extract_lifecycle_hooks(
     value: &mut serde_yaml::Value,
-) -> HashMap<String, LifecycleHooks> {
+) -> color_eyre::Result<HashMap<String, LifecycleHooks>> {
     let mut hooks_map = HashMap::new();
 
     let Some(serde_yaml::Value::Mapping(services)) = value.get_mut("services") else {
-        return hooks_map;
+        return Ok(hooks_map);
     };
 
     for (name, service) in services.iter_mut() {
@@ -78,17 +80,25 @@ fn extract_lifecycle_hooks(
         if let Some(post_start) = service_map
             .remove(serde_yaml::Value::String("post_start".into()))
         {
-            if let Ok(entries) = serde_yaml::from_value::<Vec<HookEntry>>(post_start) {
-                hooks.post_start = entries.into_iter().map(|e| e.command).collect();
-            }
+            hooks.post_start = serde_yaml::from_value::<Vec<HookEntry>>(post_start)
+                .wrap_err_with(|| {
+                    format!("invalid `post_start` hooks for service `{name}`")
+                })?
+                .into_iter()
+                .map(|e| e.command)
+                .collect();
         }
 
         if let Some(pre_stop) = service_map
             .remove(serde_yaml::Value::String("pre_stop".into()))
         {
-            if let Ok(entries) = serde_yaml::from_value::<Vec<HookEntry>>(pre_stop) {
-                hooks.pre_stop = entries.into_iter().map(|e| e.command).collect();
-            }
+            hooks.pre_stop = serde_yaml::from_value::<Vec<HookEntry>>(pre_stop)
+                .wrap_err_with(|| {
+                    format!("invalid `pre_stop` hooks for service `{name}`")
+                })?
+                .into_iter()
+                .map(|e| e.command)
+                .collect();
         }
 
         if !hooks.post_start.is_empty() || !hooks.pre_stop.is_empty() {
@@ -96,7 +106,7 @@ fn extract_lifecycle_hooks(
         }
     }
 
-    hooks_map
+    Ok(hooks_map)
 }
 
 /// Converts a [`Command`] into a [`Vec<String>`], splitting the [`String`](Command::String) variant
@@ -305,7 +315,7 @@ fn read_from_file_or_stdin(
             None => "data from stdin is not valid YAML".into(),
         })?;
 
-    let hooks = extract_lifecycle_hooks(&mut value);
+    let hooks = extract_lifecycle_hooks(&mut value)?;
 
     let compose = options
         .from_yaml_value(value)
@@ -333,7 +343,7 @@ fn read_from_stdin(
     let mut value: serde_yaml::Value = serde_yaml::from_reader(stdin)
         .wrap_err("data from stdin is not valid YAML")?;
 
-    let hooks = extract_lifecycle_hooks(&mut value);
+    let hooks = extract_lifecycle_hooks(&mut value)?;
 
     let compose = options
         .from_yaml_value(value)
@@ -552,7 +562,7 @@ fn service_try_into_quadlet_file(
         .unwrap_or_default();
 
     if let Some(hooks) = lifecycle_hooks.get(name.as_str()) {
-        let (exec_start_post, exec_stop) = hooks.clone().into_service_fields();
+        let (exec_start_post, exec_stop) = hooks.to_service_fields();
         service.exec_start_post = exec_start_post;
         service.exec_stop = exec_stop;
     }
@@ -653,4 +663,80 @@ fn volumes_try_into_quadlet_files(
             }
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_hooks_post_start_and_pre_stop() {
+        let yaml = r#"
+services:
+  app:
+    image: example
+    post_start:
+      - command: ["pg_isready", "-U", "postgres"]
+    pre_stop:
+      - command: ["pg_ctl", "stop", "-m", "fast"]
+"#;
+        let mut value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let hooks = extract_lifecycle_hooks(&mut value).unwrap();
+        let app_hooks = hooks.get("app").unwrap();
+        assert_eq!(
+            app_hooks.post_start,
+            vec![vec!["pg_isready", "-U", "postgres"]]
+        );
+        assert_eq!(
+            app_hooks.pre_stop,
+            vec![vec!["pg_ctl", "stop", "-m", "fast"]]
+        );
+    }
+
+    #[test]
+    fn extract_hooks_removes_keys_from_value() {
+        let yaml = r#"
+services:
+  app:
+    image: example
+    post_start:
+      - command: ["echo", "hi"]
+"#;
+        let mut value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        extract_lifecycle_hooks(&mut value).unwrap();
+        // post_start key should be gone so compose_spec won't choke on it
+        let svc = &value["services"]["app"];
+        assert!(svc.get("post_start").is_none());
+    }
+
+    #[test]
+    fn extract_hooks_malformed_returns_error() {
+        let yaml = r#"
+services:
+  app:
+    image: example
+    post_start: "not-a-list"
+"#;
+        let mut value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        assert!(extract_lifecycle_hooks(&mut value).is_err());
+    }
+
+    #[test]
+    fn to_service_fields_formats_with_systemd_specifier() {
+        let hooks = LifecycleHooks {
+            post_start: vec![vec!["pg_isready".into(), "-U".into(), "postgres".into()]],
+            pre_stop: vec![vec![
+                "pg_ctl".into(),
+                "stop".into(),
+                "-m".into(),
+                "fast".into(),
+            ]],
+        };
+        let (start_post, stop) = hooks.to_service_fields();
+        assert_eq!(
+            start_post,
+            vec!["podman exec systemd-%N pg_isready -U postgres"]
+        );
+        assert_eq!(stop, vec!["podman exec systemd-%N pg_ctl stop -m fast"]);
+    }
 }

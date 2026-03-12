@@ -9,7 +9,7 @@ services:
       - pg_data:/var/lib/postgresql/data:Z
 
     # --- Lifecycle hooks (compose spec 2024, not yet in compose_spec crate 0.3.0) ---
-    # Silently ignored by podlet; use ExecStartPost= / ExecStopPre= in a systemd drop-in instead.
+    # Translated to ExecStartPost= / ExecStop= via `podman exec systemd-%N` in the [Service] section.
     post_start:
       - command: ["pg_isready", "-U", "postgres"]
     pre_stop:
