@@ -7,18 +7,34 @@ services:
       - "127.0.0.1:11434:11434"
     volumes:
       - ollama_data:/root/.ollama:Z
+    # `deploy` is the compose-spec standard for GPU access but is not supported by podlet.
+    # It uses nvidia-container-runtime (Docker) or CDI (Podman) to inject device nodes
+    # and driver libraries. Use the `devices` block below instead for podlet.
+    #
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+            - driver: nvidia
               count: all
               capabilities: [gpu]
-    # Use `/dev/dri` for AMD / Nvidia
+            - driver: amdgpu
+              count: all
+              capabilities: [gpu]
+
+    # Raw device node passthrough — works with podlet.
+    # NVIDIA: requires kernel module loaded (/dev/nvidia* present).
+    # AMD/Intel: use /dev/dri/renderD128 (and card0 if display output needed).
+    devices:
+      - /dev/nvidia0:/dev/nvidia0
+      - /dev/nvidiactl:/dev/nvidiactl
+      - /dev/nvidia-uvm:/dev/nvidia-uvm
+    # AMD / Intel:
     # devices:
-    #   - /dev/nvidia0:/dev/nvidia0
-    #   - /dev/nvidiactl:/dev/nvidiactl
-    #   - /dev/nvidia-uvm:/dev/nvidia-uvm
+    #   - /dev/dri/renderD128:/dev/dri/renderD128
     security_opt:
       - no-new-privileges
     cap_drop:

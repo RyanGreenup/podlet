@@ -192,25 +192,37 @@ fn deploy_into_devices(
             extensions,
         } = device;
 
-        ensure!(device_ids.is_empty(), "`deploy.resources.reservations.devices.device_ids` is not supported");
         ensure!(options.is_empty(), "`deploy.resources.reservations.devices.options` is not supported");
         ensure!(extensions.is_empty(), "compose extensions are not supported");
 
         let driver = driver.as_deref().unwrap_or("nvidia");
-        let count = match count {
-            Some(compose_spec::service::deploy::resources::Count::All) | None => "all".to_owned(),
-            Some(compose_spec::service::deploy::resources::Count::Integer(n)) => n.to_string(),
+
+        // `count` and `device_ids` are mutually exclusive per the compose spec.
+        // When `device_ids` is set, each ID produces a CDI device per capability.
+        // When `count` is set (or neither), use count for all capabilities.
+        let identifiers: Vec<String> = if device_ids.is_empty() {
+            let count = match count {
+                Some(compose_spec::service::deploy::resources::Count::All) | None => {
+                    "all".to_owned()
+                }
+                Some(compose_spec::service::deploy::resources::Count::Integer(n)) => n.to_string(),
+            };
+            vec![count]
+        } else {
+            device_ids.into_iter().collect()
         };
 
         for capability in &capabilities {
-            let cdi = format!("{driver}.com/{capability}={count}");
-            result.push(crate::quadlet::container::Device {
-                host: cdi.into(),
-                container: None,
-                read: false,
-                write: false,
-                mknod: false,
-            });
+            for id in &identifiers {
+                let cdi = format!("{driver}.com/{capability}={id}");
+                result.push(crate::quadlet::container::Device {
+                    host: cdi.into(),
+                    container: None,
+                    read: false,
+                    write: false,
+                    mknod: false,
+                });
+            }
         }
     }
 
