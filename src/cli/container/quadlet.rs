@@ -300,7 +300,7 @@ pub struct QuadletOptions {
     ///
     /// Converts to "Memory=NUMBER[UNIT]"
     #[arg(short, long, value_name = "NUMBER[UNIT]")]
-    memory: Option<String>,
+    pub(super) memory: Option<String>,
 
     /// Attach a filesystem mount to the container
     ///
@@ -343,7 +343,7 @@ pub struct QuadletOptions {
         allow_negative_numbers = true,
         value_parser = pids_limit_parser()
     )]
-    pids_limit: Option<Limit<u32>>,
+    pub(super) pids_limit: Option<Limit<u32>>,
 
     /// Publish a container's port, or a range of ports, to the host
     ///

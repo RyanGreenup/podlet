@@ -100,7 +100,7 @@ pub struct PodmanArgs {
 
     /// Number of CPUs
     #[arg(long, value_name = "NUMBER")]
-    cpus: Option<f64>,
+    pub(super) cpus: Option<f64>,
 
     /// CPUs in which to allow execution
     #[arg(long, value_name = "NUMBER")]

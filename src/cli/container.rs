@@ -5,6 +5,7 @@ pub mod security_opt;
 
 use clap::Args;
 use color_eyre::eyre::{Context, OptionExt};
+use compose_spec::service::Limit;
 
 use crate::escape::command_join;
 
@@ -80,8 +81,13 @@ impl TryFrom<compose_spec::Service> for Container {
 
         unsupported.ensure_empty()?;
 
-        let deploy_devices = deploy
-            .map(deploy_into_devices)
+        let DeployResources {
+            devices,
+            memory,
+            pids_limit,
+            cpus,
+        } = deploy
+            .map(deploy_into_resources)
             .transpose()?
             .unwrap_or_default();
 
@@ -100,11 +106,22 @@ impl TryFrom<compose_spec::Service> for Container {
             .wrap_err("invalid security option")?;
 
         let mut quadlet_options: QuadletOptions = quadlet.try_into()?;
-        quadlet_options.device.extend(deploy_devices);
+        quadlet_options.device.extend(devices);
+        if quadlet_options.memory.is_none() {
+            quadlet_options.memory = memory;
+        }
+        if quadlet_options.pids_limit.is_none() {
+            quadlet_options.pids_limit = pids_limit;
+        }
+
+        let mut podman_args: PodmanArgs = podman_args.try_into()?;
+        if podman_args.cpus.is_none() {
+            podman_args.cpus = cpus;
+        }
 
         Ok(Self {
             quadlet_options,
-            podman_args: podman_args.try_into()?,
+            podman_args,
             security_opt,
             image: image.ok_or_eyre("`image` or `build` is required")?.into(),
             command: command
@@ -115,13 +132,20 @@ impl TryFrom<compose_spec::Service> for Container {
     }
 }
 
-/// Extract device reservations from [`compose_spec::service::Deploy`] and convert them to
-/// CDI-format [`Device`](crate::quadlet::container::Device) values.
-///
-/// Other `deploy` fields are not supported and will cause an error.
-fn deploy_into_devices(
+/// Resources extracted from [`compose_spec::service::Deploy`].
+#[derive(Default)]
+struct DeployResources {
+    devices: Vec<crate::quadlet::container::Device>,
+    memory: Option<String>,
+    pids_limit: Option<Limit<u32>>,
+    cpus: Option<f64>,
+}
+
+/// Extract resources from [`compose_spec::service::Deploy`] and convert them to quadlet/podman
+/// fields. Unsupported deploy fields cause an error.
+fn deploy_into_resources(
     deploy: compose_spec::service::Deploy,
-) -> color_eyre::Result<Vec<crate::quadlet::container::Device>> {
+) -> color_eyre::Result<DeployResources> {
     use color_eyre::eyre::ensure;
 
     let compose_spec::service::Deploy {
@@ -148,7 +172,7 @@ fn deploy_into_devices(
     ensure!(extensions.is_empty(), "compose extensions are not supported");
 
     let Some(resources) = resources else {
-        return Ok(Vec::new());
+        return Ok(DeployResources::default());
     };
 
     let compose_spec::service::deploy::Resources {
@@ -157,23 +181,41 @@ fn deploy_into_devices(
         extensions,
     } = resources;
 
-    ensure!(limits.is_none(), "`deploy.resources.limits` is not supported");
     ensure!(extensions.is_empty(), "compose extensions are not supported");
 
+    let (result_memory, result_pids_limit, result_cpus) = if let Some(limits) = limits {
+        let compose_spec::service::deploy::resources::Limits {
+            cpus,
+            memory,
+            pids,
+            extensions,
+        } = limits;
+        ensure!(extensions.is_empty(), "compose extensions are not supported");
+        (
+            memory.map(|m| m.to_string()),
+            pids,
+            cpus.map(f64::from),
+        )
+    } else {
+        (None, None, None)
+    };
+
     let Some(reservations) = reservations else {
-        return Ok(Vec::new());
+        return Ok(DeployResources {
+            devices: Vec::new(),
+            memory: result_memory,
+            pids_limit: result_pids_limit,
+            cpus: result_cpus,
+        });
     };
 
     let compose_spec::service::deploy::resources::Reservations {
-        cpus,
-        memory,
+        cpus: _,
+        memory: _,
         devices,
         generic_resources,
         extensions,
     } = reservations;
-
-    ensure!(cpus.is_none(), "`deploy.resources.reservations.cpus` is not supported");
-    ensure!(memory.is_none(), "`deploy.resources.reservations.memory` is not supported");
     ensure!(
         generic_resources.is_empty(),
         "`deploy.resources.reservations.generic_resources` is not supported"
@@ -226,7 +268,12 @@ fn deploy_into_devices(
         }
     }
 
-    Ok(result)
+    Ok(DeployResources {
+        devices: result,
+        memory: result_memory,
+        pids_limit: result_pids_limit,
+        cpus: result_cpus,
+    })
 }
 
 impl From<Container> for crate::quadlet::Container {
