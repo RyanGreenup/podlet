@@ -4,7 +4,7 @@ services:
     image: docker.io/library/postgres:17
     restart: unless-stopped
     environment:
-      POSTGRES_PASSWORD: example
+      POSTGRES_PASSWORD: ${SOME_PASS}
     volumes:
       - pg_data:/var/lib/postgresql/data:Z
 

@@ -226,6 +226,12 @@ pub struct Compose {
     /// in the current working directory.
     #[allow(clippy::struct_field_names)]
     pub compose_file: Option<PathBuf>,
+
+    /// Override the env file path (default: `.env` in compose file directory)
+    ///
+    /// Set to `/dev/null` or an empty path to disable env file loading.
+    #[arg(long, value_name = "PATH")]
+    pub env_file: Option<PathBuf>,
 }
 
 impl Compose {
@@ -243,12 +249,15 @@ impl Compose {
             pod,
             kube,
             compose_file,
+            env_file,
         } = self;
 
         let mut options = compose_spec::Compose::options();
         options.apply_merge(true);
+        let env = load_env(env_file.as_deref(), compose_file.as_deref())
+            .wrap_err("error loading env file")?;
         let (compose, lifecycle_hooks) =
-            read_from_file_or_stdin(compose_file.as_deref(), &options)
+            read_from_file_or_stdin(compose_file.as_deref(), &options, &env)
                 .wrap_err("error reading compose file")?;
         compose
             .validate_all()
@@ -331,6 +340,7 @@ impl Compose {
 fn read_from_file_or_stdin(
     path: Option<&Path>,
     options: &Options,
+    env: &HashMap<String, String>,
 ) -> color_eyre::Result<(compose_spec::Compose, HashMap<String, LifecycleHooks>)> {
     const FILE_NAMES: [&str; 6] = [
         "compose.yaml",
@@ -343,21 +353,21 @@ fn read_from_file_or_stdin(
 
     if let Some(path) = path {
         if path.as_os_str() == "-" {
-            return read_from_stdin(options);
+            return read_from_stdin(options, env);
         }
         let file = fs::File::open(path)
             .wrap_err("could not open provided compose file")
             .suggestion("make sure you have the proper permissions for the given file")?;
-        return parse_compose(file, options, &path.display().to_string());
+        return parse_compose(file, options, &path.display().to_string(), env);
     }
 
     if !io::stdin().is_terminal() {
-        return read_from_stdin(options);
+        return read_from_stdin(options, env);
     }
 
     for file_name in FILE_NAMES {
         if let Ok(file) = fs::File::open(file_name) {
-            return parse_compose(file, options, file_name);
+            return parse_compose(file, options, file_name, env);
         }
     }
 
@@ -380,12 +390,14 @@ fn parse_compose(
     reader: impl io::Read,
     options: &Options,
     source: &str,
+    env: &HashMap<String, String>,
 ) -> color_eyre::Result<(compose_spec::Compose, HashMap<String, LifecycleHooks>)> {
     let mut value: serde_yaml::Value = serde_yaml::from_reader(reader)
         .wrap_err_with(|| format!("`{source}` is not valid YAML"))?;
 
     let hooks = extract_lifecycle_hooks(&mut value)?;
     strip_swarm_deploy_fields(&mut value);
+    interpolate_env(&mut value, env);
 
     let compose = options
         .from_yaml_value(value)
@@ -401,13 +413,170 @@ fn parse_compose(
 /// Returns an error if stdin is a terminal or there was an error deserializing.
 fn read_from_stdin(
     options: &Options,
+    env: &HashMap<String, String>,
 ) -> color_eyre::Result<(compose_spec::Compose, HashMap<String, LifecycleHooks>)> {
     let stdin = io::stdin();
     if stdin.is_terminal() {
         bail!("cannot read compose from stdin, stdin is a terminal");
     }
 
-    parse_compose(stdin, options, "stdin")
+    parse_compose(stdin, options, "stdin", env)
+}
+
+/// Load environment variables for compose interpolation.
+///
+/// If `env_file` is `Some`, parse that file (error if not found).
+/// Otherwise, look for `.env` in the compose file's parent directory (or CWD).
+/// Process environment variables take precedence over `.env` file values.
+fn load_env(
+    env_file: Option<&Path>,
+    compose_file: Option<&Path>,
+) -> color_eyre::Result<HashMap<String, String>> {
+    let mut env: HashMap<String, String> = HashMap::new();
+
+    if let Some(path) = env_file {
+        let content = fs::read_to_string(path)
+            .wrap_err_with(|| format!("could not read env file `{}`", path.display()))?;
+        env = parse_dotenv(&content);
+    } else {
+        let dotenv_path = compose_file
+            .and_then(|p| p.parent())
+            .unwrap_or(Path::new("."))
+            .join(".env");
+        if let Ok(content) = fs::read_to_string(&dotenv_path) {
+            env = parse_dotenv(&content);
+        }
+    }
+
+    // Process environment takes precedence
+    for (k, v) in std::env::vars() {
+        env.insert(k, v);
+    }
+
+    Ok(env)
+}
+
+/// Parse a `.env` file into a map of key-value pairs.
+fn parse_dotenv(content: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_owned();
+        let value = value.trim();
+
+        // Strip outer quotes
+        let value = if (value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\''))
+        {
+            value
+                .get(1..value.len() - 1)
+                .unwrap_or(value)
+                .to_owned()
+        } else {
+            // Strip trailing comment
+            let value = if let Some(idx) = value.find(" #") {
+                value.get(..idx).unwrap_or(value).trim_end()
+            } else {
+                value
+            };
+            value.to_owned()
+        };
+
+        map.insert(key, value);
+    }
+    map
+}
+
+/// Recursively interpolate environment variables in all string values of a YAML value.
+fn interpolate_env(value: &mut serde_yaml::Value, env: &HashMap<String, String>) {
+    match value {
+        serde_yaml::Value::String(s) => {
+            let result = interpolate_str(s, env);
+            *s = result;
+        }
+        serde_yaml::Value::Mapping(map) => {
+            for (_, v) in map.iter_mut() {
+                interpolate_env(v, env);
+            }
+        }
+        serde_yaml::Value::Sequence(seq) => {
+            for item in seq.iter_mut() {
+                interpolate_env(item, env);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Interpolate `${VAR}`, `${VAR:-default}`, `${VAR-default}`, `$VAR`, and `$$` in a string.
+fn interpolate_str(s: &str, env: &HashMap<String, String>) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch != '$' {
+            result.push(ch);
+            continue;
+        }
+        match chars.peek() {
+            Some('$') => {
+                chars.next();
+                result.push('$');
+            }
+            Some('{') => {
+                chars.next(); // consume '{'
+                let mut var = String::new();
+                for c in chars.by_ref() {
+                    if c == '}' {
+                        break;
+                    }
+                    var.push(c);
+                }
+                if let Some((name, default)) = var.split_once(":-") {
+                    let val = env
+                        .get(name)
+                        .filter(|v| !v.is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| default.to_owned());
+                    result.push_str(&val);
+                } else if let Some((name, default)) = var.split_once('-') {
+                    let val = env
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_else(|| default.to_owned());
+                    result.push_str(&val);
+                } else {
+                    let val = env.get(&var).cloned().unwrap_or_default();
+                    result.push_str(&val);
+                }
+            }
+            Some(&c) if c.is_ascii_alphabetic() || c == '_' => {
+                let mut ident = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c.is_ascii_alphanumeric() || c == '_' {
+                        ident.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                let val = env.get(&ident).cloned().unwrap_or_default();
+                result.push_str(&val);
+            }
+            _ => {
+                result.push('$');
+            }
+        }
+    }
+
+    result
 }
 
 /// Attempt to convert [`Service`]s, [`Networks`], and [`Volumes`] into [`File`]s.
@@ -1028,6 +1197,48 @@ networks:
             start_post,
             vec!["podman exec --user appuser --privileged --workdir /workspace --env 'DEBUG=1' mycontainer app --check"]
         );
+    }
+
+    #[test]
+    fn interpolate_str_simple() {
+        let mut env = HashMap::new();
+        env.insert("FOO".to_owned(), "bar".to_owned());
+        assert_eq!(interpolate_str("${FOO}", &env), "bar");
+    }
+
+    #[test]
+    fn interpolate_str_default() {
+        let env = HashMap::new();
+        assert_eq!(interpolate_str("${FOO:-fallback}", &env), "fallback");
+    }
+
+    #[test]
+    fn interpolate_str_dollar_dollar() {
+        let env = HashMap::new();
+        assert_eq!(interpolate_str("$$", &env), "$");
+    }
+
+    #[test]
+    fn interpolate_str_unresolved() {
+        let env = HashMap::new();
+        assert_eq!(interpolate_str("${MISSING}", &env), "");
+    }
+
+    #[test]
+    fn parse_dotenv_basic() {
+        let content = "KEY=VALUE\n#comment\n\nEXPORT=yes";
+        let map = parse_dotenv(content);
+        assert_eq!(map.get("KEY").map(String::as_str), Some("VALUE"));
+        assert_eq!(map.get("EXPORT").map(String::as_str), Some("yes"));
+        assert!(!map.contains_key("#comment"));
+    }
+
+    #[test]
+    fn parse_dotenv_quoted() {
+        let content = "KEY=\"quoted value\"\nSINGLE='single quoted'";
+        let map = parse_dotenv(content);
+        assert_eq!(map.get("KEY").map(String::as_str), Some("quoted value"));
+        assert_eq!(map.get("SINGLE").map(String::as_str), Some("single quoted"));
     }
 
     #[test]
