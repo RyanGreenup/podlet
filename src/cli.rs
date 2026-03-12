@@ -71,6 +71,10 @@ pub struct Cli {
     /// Equivalent to `--file $XDG_CONFIG_HOME/containers/systemd/` for non-root users,
     /// or `--file /etc/containers/systemd/` for root.
     ///
+    /// Optionally provide a subdirectory name to place the file in a subdirectory
+    /// of the unit directory, e.g. `-u myapp` writes to
+    /// `$XDG_CONFIG_HOME/containers/systemd/myapp/`.
+    ///
     /// The name of the file can be specified with the --name option.
     #[arg(
         short,
@@ -79,7 +83,7 @@ pub struct Cli {
         conflicts_with = "file",
         group = "file_out"
     )]
-    unit_directory: bool,
+    unit_directory: Option<Option<PathBuf>>,
 
     /// Override the name of the generated file (without the extension)
     ///
@@ -248,7 +252,7 @@ multiple times.";
         let split_options = self.split_options.iter().copied().collect();
         let join_options = &JoinOption::all_set() - &split_options;
 
-        if self.unit_directory || self.file.is_some() {
+        if self.unit_directory.is_some() || self.file.is_some() {
             let path = self.file_path()?;
             if matches!(path, FilePath::Full(..))
                 && matches!(self.command, Commands::Compose { .. })
@@ -302,21 +306,27 @@ multiple times.";
 
     /// Returns the file path for the generated file
     fn file_path(&self) -> color_eyre::Result<FilePath> {
-        let path = if self.unit_directory {
+        let path = if let Some(subdir) = &self.unit_directory {
             #[cfg(unix)]
-            if rustix::process::getuid().is_root() {
-                let path = PathBuf::from("/etc/containers/systemd/");
-                if path.is_dir() {
-                    path
+            {
+                let mut path = if rustix::process::getuid().is_root() {
+                    let path = PathBuf::from("/etc/containers/systemd/");
+                    if path.is_dir() {
+                        path
+                    } else {
+                        PathBuf::from("/usr/share/containers/systemd/")
+                    }
                 } else {
-                    PathBuf::from("/usr/share/containers/systemd/")
+                    let mut path: PathBuf = env::var("XDG_CONFIG_HOME")
+                        .or_else(|_| env::var("HOME").map(|home| format!("{home}/.config")))
+                        .unwrap_or_else(|_| String::from("~/.config/"))
+                        .into();
+                    path.push("containers/systemd/");
+                    path
+                };
+                if let Some(subdir) = subdir {
+                    path.push(subdir);
                 }
-            } else {
-                let mut path: PathBuf = env::var("XDG_CONFIG_HOME")
-                    .or_else(|_| env::var("HOME").map(|home| format!("{home}/.config")))
-                    .unwrap_or_else(|_| String::from("~/.config/"))
-                    .into();
-                path.push("containers/systemd/");
                 path
             }
 
