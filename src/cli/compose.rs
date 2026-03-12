@@ -38,18 +38,21 @@ struct LifecycleHooks {
 impl LifecycleHooks {
     /// Convert lifecycle hooks into systemd `ExecStartPost=` and `ExecStop=` commands.
     ///
-    /// Each command is wrapped with `podman exec systemd-%N` so it runs inside the container.
-    /// `%N` is the systemd unit-name specifier (without type suffix), matching the default
-    /// quadlet container name of `systemd-%N` (see `ContainerName=` in podman-systemd.unit(5)).
-    fn to_service_fields(&self) -> (Vec<String>, Vec<String>) {
-        let to_exec = |cmd: &Vec<String>| {
+    /// Each command is wrapped with `podman exec {container_name}` so it runs inside the
+    /// container. Pass `"systemd-%N"` when no explicit `ContainerName=` is set; that matches
+    /// the quadlet default (see `ContainerName=` in podman-systemd.unit(5)).
+    fn to_service_fields(
+        &self,
+        container_name: &str,
+    ) -> color_eyre::Result<(Vec<String>, Vec<String>)> {
+        let to_exec = |cmd: &Vec<String>| -> color_eyre::Result<String> {
             let args = shlex::try_join(cmd.iter().map(String::as_str))
-                .unwrap_or_else(|_| cmd.join(" "));
-            format!("podman exec systemd-%N {args}")
+                .map_err(|e| eyre!("lifecycle hook command contains an unsupported argument: {e}"))?;
+            Ok(format!("podman exec {container_name} {args}"))
         };
-        let exec_start_post = self.post_start.iter().map(&to_exec).collect();
-        let exec_stop = self.pre_stop.iter().map(to_exec).collect();
-        (exec_start_post, exec_stop)
+        let exec_start_post = self.post_start.iter().map(to_exec).collect::<color_eyre::Result<_>>()?;
+        let exec_stop = self.pre_stop.iter().map(to_exec).collect::<color_eyre::Result<_>>()?;
+        Ok((exec_start_post, exec_stop))
     }
 }
 
@@ -562,7 +565,13 @@ fn service_try_into_quadlet_file(
         .unwrap_or_default();
 
     if let Some(hooks) = lifecycle_hooks.get(name.as_str()) {
-        let (exec_start_post, exec_stop) = hooks.to_service_fields();
+        let container_name = container
+            .container_name
+            .as_deref()
+            .unwrap_or("systemd-%N");
+        let (exec_start_post, exec_stop) = hooks
+            .to_service_fields(container_name)
+            .wrap_err_with(|| format!("error converting lifecycle hooks for service `{name}`"))?;
         service.exec_start_post = exec_start_post;
         service.exec_stop = exec_stop;
     }
@@ -732,7 +741,7 @@ services:
                 "fast".into(),
             ]],
         };
-        let (start_post, stop) = hooks.to_service_fields();
+        let (start_post, stop) = hooks.to_service_fields("systemd-%N").unwrap();
         assert_eq!(
             start_post,
             vec!["podman exec systemd-%N pg_isready -U postgres"]
@@ -788,7 +797,7 @@ networks:
             ]],
             pre_stop: vec![],
         };
-        let (start_post, _stop) = hooks.to_service_fields();
+        let (start_post, _stop) = hooks.to_service_fields("systemd-%N").unwrap();
         // shlex quotes args with spaces and uses double-quotes when the arg contains an apostrophe
         assert_eq!(
             start_post,
