@@ -299,4 +299,23 @@ mod tests {
             Err(ParseDeviceError::UnknownPermission('a')),
         );
     }
+
+    #[test]
+    fn cdi_format() -> Result<(), ParseDeviceError> {
+        let device = Device {
+            host: "nvidia.com/gpu=all".into(),
+            container: None,
+            read: false,
+            write: false,
+            mknod: false,
+        };
+
+        assert_eq!(device.to_string(), "nvidia.com/gpu=all");
+
+        // CDI format should also round-trip through FromStr.
+        let parsed: Device = "nvidia.com/gpu=all".parse()?;
+        assert_eq!(parsed, device);
+
+        Ok(())
+    }
 }

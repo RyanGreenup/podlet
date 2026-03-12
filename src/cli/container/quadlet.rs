@@ -53,7 +53,7 @@ pub struct QuadletOptions {
     ///
     /// Can be specified multiple times
     #[arg(long, value_name = "HOST-DEVICE[:CONTAINER-DEVICE][:PERMISSIONS]")]
-    device: Vec<Device>,
+    pub(super) device: Vec<Device>,
 
     /// Add a custom host-to-IP mapping
     ///

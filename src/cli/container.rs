@@ -67,6 +67,7 @@ impl TryFrom<compose_spec::Service> for Container {
     fn try_from(value: compose_spec::Service) -> Result<Self, Self::Error> {
         let compose::Service {
             unsupported,
+            deploy,
             quadlet,
             podman_args,
             container:
@@ -78,6 +79,11 @@ impl TryFrom<compose_spec::Service> for Container {
         } = compose::Service::from(value);
 
         unsupported.ensure_empty()?;
+
+        let deploy_devices = deploy
+            .map(deploy_into_devices)
+            .transpose()?
+            .unwrap_or_default();
 
         let security_opt = security_opt
             .into_iter()
@@ -93,8 +99,11 @@ impl TryFrom<compose_spec::Service> for Container {
             .collect::<Result<_, _>>()
             .wrap_err("invalid security option")?;
 
+        let mut quadlet_options: QuadletOptions = quadlet.try_into()?;
+        quadlet_options.device.extend(deploy_devices);
+
         Ok(Self {
-            quadlet_options: quadlet.try_into()?,
+            quadlet_options,
             podman_args: podman_args.try_into()?,
             security_opt,
             image: image.ok_or_eyre("`image` or `build` is required")?.into(),
@@ -104,6 +113,108 @@ impl TryFrom<compose_spec::Service> for Container {
                 .unwrap_or_default(),
         })
     }
+}
+
+/// Extract device reservations from [`compose_spec::service::Deploy`] and convert them to
+/// CDI-format [`Device`](crate::quadlet::container::Device) values.
+///
+/// Other `deploy` fields are not supported and will cause an error.
+fn deploy_into_devices(
+    deploy: compose_spec::service::Deploy,
+) -> color_eyre::Result<Vec<crate::quadlet::container::Device>> {
+    use color_eyre::eyre::ensure;
+
+    let compose_spec::service::Deploy {
+        endpoint_mode,
+        labels,
+        mode,
+        placement,
+        replicas,
+        resources,
+        restart_policy,
+        rollback_config,
+        update_config,
+        extensions,
+    } = deploy;
+
+    ensure!(endpoint_mode.is_none(), "`deploy.endpoint_mode` is not supported");
+    ensure!(labels.is_empty(), "`deploy.labels` is not supported");
+    ensure!(mode.is_none(), "`deploy.mode` is not supported");
+    ensure!(placement.is_none(), "`deploy.placement` is not supported");
+    ensure!(replicas.is_none(), "`deploy.replicas` is not supported");
+    ensure!(restart_policy.is_none(), "`deploy.restart_policy` is not supported");
+    ensure!(rollback_config.is_none(), "`deploy.rollback_config` is not supported");
+    ensure!(update_config.is_none(), "`deploy.update_config` is not supported");
+    ensure!(extensions.is_empty(), "compose extensions are not supported");
+
+    let Some(resources) = resources else {
+        return Ok(Vec::new());
+    };
+
+    let compose_spec::service::deploy::Resources {
+        limits,
+        reservations,
+        extensions,
+    } = resources;
+
+    ensure!(limits.is_none(), "`deploy.resources.limits` is not supported");
+    ensure!(extensions.is_empty(), "compose extensions are not supported");
+
+    let Some(reservations) = reservations else {
+        return Ok(Vec::new());
+    };
+
+    let compose_spec::service::deploy::resources::Reservations {
+        cpus,
+        memory,
+        devices,
+        generic_resources,
+        extensions,
+    } = reservations;
+
+    ensure!(cpus.is_none(), "`deploy.resources.reservations.cpus` is not supported");
+    ensure!(memory.is_none(), "`deploy.resources.reservations.memory` is not supported");
+    ensure!(
+        generic_resources.is_empty(),
+        "`deploy.resources.reservations.generic_resources` is not supported"
+    );
+    ensure!(extensions.is_empty(), "compose extensions are not supported");
+
+    let mut result = Vec::new();
+
+    for device in devices {
+        let compose_spec::service::deploy::resources::Device {
+            capabilities,
+            driver,
+            count,
+            device_ids,
+            options,
+            extensions,
+        } = device;
+
+        ensure!(device_ids.is_empty(), "`deploy.resources.reservations.devices.device_ids` is not supported");
+        ensure!(options.is_empty(), "`deploy.resources.reservations.devices.options` is not supported");
+        ensure!(extensions.is_empty(), "compose extensions are not supported");
+
+        let driver = driver.as_deref().unwrap_or("nvidia");
+        let count = match count {
+            Some(compose_spec::service::deploy::resources::Count::All) | None => "all".to_owned(),
+            Some(compose_spec::service::deploy::resources::Count::Integer(n)) => n.to_string(),
+        };
+
+        for capability in &capabilities {
+            let cdi = format!("{driver}.com/{capability}={count}");
+            result.push(crate::quadlet::container::Device {
+                host: cdi.into(),
+                container: None,
+                read: false,
+                write: false,
+                mknod: false,
+            });
+        }
+    }
+
+    Ok(result)
 }
 
 impl From<Container> for crate::quadlet::Container {

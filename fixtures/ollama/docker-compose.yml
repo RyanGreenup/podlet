@@ -7,27 +7,18 @@ services:
       - "127.0.0.1:11434:11434"
     volumes:
       - ollama_data:/root/.ollama:Z
-    # The compose-spec standard for GPU access is `deploy.resources.reservations.devices`.
-    # It uses the runtime's device abstraction (CDI on Podman, nvidia-container-runtime on Docker)
-    # to inject not just device nodes but also driver libraries into the container.
-    # Podlet does not yet support `deploy`, so it is commented out here in favor of
-    # the raw `devices` passthrough below.
-    #
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: all
-    #           capabilities: [gpu]
-    # CDI format (nvidia.com/gpu=all) is not supported in the compose `devices` field by podlet.
-    # Use the raw NVIDIA device nodes instead; CDI is the cleaner runtime approach but requires
-    # nvidia-ctk cdi generate to have been run first (see justfile).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     # Use `/dev/dri` for AMD / Nvidia
-    devices:
-      - /dev/nvidia0:/dev/nvidia0
-      - /dev/nvidiactl:/dev/nvidiactl
-      - /dev/nvidia-uvm:/dev/nvidia-uvm
+    # devices:
+    #   - /dev/nvidia0:/dev/nvidia0
+    #   - /dev/nvidiactl:/dev/nvidiactl
+    #   - /dev/nvidia-uvm:/dev/nvidia-uvm
     security_opt:
       - no-new-privileges
     cap_drop:

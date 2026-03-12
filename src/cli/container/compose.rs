@@ -20,6 +20,7 @@ use indexmap::{IndexMap, IndexSet};
 /// [`Container`](super::Container).
 pub struct Service {
     pub unsupported: Unsupported,
+    pub deploy: Option<Deploy>,
     pub quadlet: Quadlet,
     pub podman_args: PodmanArgs,
     pub container: Container,
@@ -132,7 +133,6 @@ impl From<compose_spec::Service> for Service {
                 cpu_percent,
                 configs,
                 credential_spec,
-                deploy,
                 develop,
                 domain_name,
                 extends,
@@ -145,6 +145,7 @@ impl From<compose_spec::Service> for Service {
                 volumes_from,
                 extensions,
             },
+            deploy,
             quadlet: Quadlet {
                 cap_add,
                 cap_drop,
@@ -227,7 +228,6 @@ pub struct Unsupported {
     cpu_percent: Option<Percent>,
     configs: Vec<ShortOrLong<Identifier, ConfigOrSecret>>,
     credential_spec: Option<CredentialSpec>,
-    deploy: Option<Deploy>,
     develop: Option<Develop>,
     domain_name: Option<Hostname>,
     extends: Option<Extends>,
@@ -255,7 +255,6 @@ impl Unsupported {
             cpu_percent,
             configs,
             credential_spec,
-            deploy,
             develop,
             domain_name,
             extends,
@@ -277,7 +276,6 @@ impl Unsupported {
             ("cpu_percent", cpu_percent.is_none()),
             ("configs", configs.is_empty()),
             ("credential_spec", credential_spec.is_none()),
-            ("deploy", deploy.is_none()),
             ("develop", develop.is_none()),
             ("domain_name", domain_name.is_none()),
             ("extends", extends.is_none()),
