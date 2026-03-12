@@ -12,8 +12,13 @@ services:
     # Translated to ExecStartPost= / ExecStop= via `podman exec systemd-%N` in the [Service] section.
     post_start:
       - command: ["pg_isready", "-U", "postgres"]
+        user: postgres
+        working_dir: /var/lib/postgresql
     pre_stop:
       - command: ["pg_ctl", "stop", "-m", "fast"]
+        privileged: false
+        environment:
+          PGDATA: /var/lib/postgresql/data
 
     # --- Resource limits ---
     # mem_limit → Memory= in [Container]
