@@ -12,14 +12,28 @@ pub struct Service {
     /// Configure if and when the service should be restarted.
     #[arg(long, value_name = "POLICY")]
     pub restart: Option<RestartConfig>,
+
+    /// Commands to run after the main container process starts.
+    #[arg(skip)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exec_start_post: Vec<String>,
+
+    /// Commands to run to stop the service.
+    #[arg(skip)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exec_stop: Vec<String>,
 }
 
 impl Service {
-    /// Returns `true` if all fields are [`None`].
+    /// Returns `true` if all fields are unset or empty.
     pub fn is_empty(&self) -> bool {
-        let Self { restart } = self;
+        let Self {
+            restart,
+            exec_start_post,
+            exec_stop,
+        } = self;
 
-        restart.is_none()
+        restart.is_none() && exec_start_post.is_empty() && exec_stop.is_empty()
     }
 }
 
@@ -27,6 +41,7 @@ impl From<RestartConfig> for Service {
     fn from(restart: RestartConfig) -> Self {
         Self {
             restart: Some(restart),
+            ..Self::default()
         }
     }
 }
@@ -60,5 +75,38 @@ impl From<Restart> for RestartConfig {
             Restart::Always | Restart::UnlessStopped => Self::Always,
             Restart::OnFailure => Self::OnFailure,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_with_hooks_serializes() -> Result<(), crate::serde::quadlet::Error> {
+        let service = Service {
+            exec_start_post: vec!["podman exec systemd-%N pg_isready -U postgres".into()],
+            exec_stop: vec!["podman exec systemd-%N pg_ctl stop -m fast".into()],
+            ..Service::default()
+        };
+        assert_eq!(
+            crate::serde::quadlet::to_string_join_all(service)?,
+            "[Service]\nExecStartPost=podman exec systemd-%N pg_isready -U postgres\nExecStop=podman exec systemd-%N pg_ctl stop -m fast\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_service_is_empty() {
+        assert!(Service::default().is_empty());
+    }
+
+    #[test]
+    fn service_with_exec_start_post_not_empty() {
+        let service = Service {
+            exec_start_post: vec!["cmd".into()],
+            ..Service::default()
+        };
+        assert!(!service.is_empty());
     }
 }

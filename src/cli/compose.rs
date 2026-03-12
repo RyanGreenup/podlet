@@ -16,9 +16,142 @@ use compose_spec::{
 };
 use indexmap::IndexMap;
 
+use serde::Deserialize;
+
 use crate::quadlet::{self, GenericSections, Globals, container::volume::Source};
 
 use super::{Build, Container, File, GlobalArgs, k8s};
+
+/// The `environment` field of a lifecycle hook entry, which can be a list or a map.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(untagged)]
+enum HookEnvironment {
+    List(Vec<String>),
+    Map(IndexMap<String, Option<String>>),
+}
+
+impl HookEnvironment {
+    fn env_args(&self) -> Vec<String> {
+        match self {
+            Self::List(list) => list.clone(),
+            Self::Map(map) => map
+                .iter()
+                .map(|(k, v)| match v {
+                    Some(val) => format!("{k}={val}"),
+                    None => k.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// A single lifecycle hook entry from a compose file.
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(default)]
+struct HookEntry {
+    command: Vec<String>,
+    user: Option<String>,
+    privileged: bool,
+    working_dir: Option<String>,
+    environment: Option<HookEnvironment>,
+}
+
+/// Lifecycle hooks extracted from a compose service.
+#[derive(Default, Debug, Clone)]
+struct LifecycleHooks {
+    post_start: Vec<HookEntry>,
+    pre_stop: Vec<HookEntry>,
+}
+
+impl LifecycleHooks {
+    /// Convert lifecycle hooks into systemd `ExecStartPost=` and `ExecStop=` commands.
+    ///
+    /// Each command is wrapped with `podman exec {container_name}` so it runs inside the
+    /// container. Pass `"systemd-%N"` when no explicit `ContainerName=` is set; that matches
+    /// the quadlet default (see `ContainerName=` in podman-systemd.unit(5)).
+    fn to_service_fields(
+        &self,
+        container_name: &str,
+    ) -> color_eyre::Result<(Vec<String>, Vec<String>)> {
+        let to_exec = |entry: &HookEntry| -> color_eyre::Result<String> {
+            let mut args: Vec<String> = vec!["podman".into(), "exec".into()];
+            if let Some(user) = &entry.user {
+                args.push("--user".into());
+                args.push(user.clone());
+            }
+            if entry.privileged {
+                args.push("--privileged".into());
+            }
+            if let Some(wd) = &entry.working_dir {
+                args.push("--workdir".into());
+                args.push(wd.clone());
+            }
+            if let Some(env) = &entry.environment {
+                for var in env.env_args() {
+                    args.push("--env".into());
+                    args.push(var);
+                }
+            }
+            args.push(container_name.into());
+            args.extend(entry.command.iter().cloned());
+            shlex::try_join(args.iter().map(String::as_str))
+                .map_err(|e| eyre!("lifecycle hook command contains an unsupported argument: {e}"))
+        };
+        let exec_start_post = self.post_start.iter().map(to_exec).collect::<color_eyre::Result<_>>()?;
+        let exec_stop = self.pre_stop.iter().map(to_exec).collect::<color_eyre::Result<_>>()?;
+        Ok((exec_start_post, exec_stop))
+    }
+}
+
+/// Extract `post_start` and `pre_stop` lifecycle hooks from the YAML value.
+///
+/// These keys are not recognized by `compose_spec` v0.3.0 and must be removed before
+/// deserialization. Returns a map of service name to hooks.
+fn extract_lifecycle_hooks(
+    value: &mut serde_yaml::Value,
+) -> color_eyre::Result<HashMap<String, LifecycleHooks>> {
+    let mut hooks_map = HashMap::new();
+
+    let Some(serde_yaml::Value::Mapping(services)) = value.get_mut("services") else {
+        return Ok(hooks_map);
+    };
+
+    for (name, service) in services.iter_mut() {
+        let Some(name) = name.as_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+
+        let Some(service_map) = service.as_mapping_mut() else {
+            continue;
+        };
+
+        let mut hooks = LifecycleHooks::default();
+
+        if let Some(post_start) = service_map
+            .remove(serde_yaml::Value::String("post_start".into()))
+        {
+            hooks.post_start = serde_yaml::from_value::<Vec<HookEntry>>(post_start)
+                .wrap_err_with(|| {
+                    format!("invalid `post_start` hooks for service `{name}`")
+                })?;
+        }
+
+        if let Some(pre_stop) = service_map
+            .remove(serde_yaml::Value::String("pre_stop".into()))
+        {
+            hooks.pre_stop = serde_yaml::from_value::<Vec<HookEntry>>(pre_stop)
+                .wrap_err_with(|| {
+                    format!("invalid `pre_stop` hooks for service `{name}`")
+                })?;
+        }
+
+        if !hooks.post_start.is_empty() || !hooks.pre_stop.is_empty() {
+            hooks_map.insert(name, hooks);
+        }
+    }
+
+    Ok(hooks_map)
+}
 
 /// Converts a [`Command`] into a [`Vec<String>`], splitting the [`String`](Command::String) variant
 /// as a shell would.
@@ -94,8 +227,9 @@ impl Compose {
 
         let mut options = compose_spec::Compose::options();
         options.apply_merge(true);
-        let compose = read_from_file_or_stdin(compose_file.as_deref(), &options)
-            .wrap_err("error reading compose file")?;
+        let (compose, lifecycle_hooks) =
+            read_from_file_or_stdin(compose_file.as_deref(), &options)
+                .wrap_err("error reading compose file")?;
         compose
             .validate_all()
             .wrap_err("error validating compose file")?;
@@ -152,7 +286,7 @@ impl Compose {
                 "compose extensions are not supported"
             );
 
-            parts_try_into_files(services, networks, volumes, pod_name, sections)
+            parts_try_into_files(services, networks, volumes, pod_name, sections, &lifecycle_hooks)
                 .wrap_err("error converting compose file into Quadlet files")
         }
     }
@@ -177,48 +311,66 @@ impl Compose {
 fn read_from_file_or_stdin(
     path: Option<&Path>,
     options: &Options,
-) -> color_eyre::Result<compose_spec::Compose> {
-    let (compose_file, path) = if let Some(path) = path {
+) -> color_eyre::Result<(compose_spec::Compose, HashMap<String, LifecycleHooks>)> {
+    if let Some(path) = path {
         if path.as_os_str() == "-" {
             return read_from_stdin(options);
         }
-        let compose_file = fs::File::open(path)
+        let file = fs::File::open(path)
             .wrap_err("could not open provided compose file")
             .suggestion("make sure you have the proper permissions for the given file")?;
-        (compose_file, path)
-    } else {
-        const FILE_NAMES: [&str; 6] = [
-            "compose.yaml",
-            "compose.yml",
-            "docker-compose.yaml",
-            "docker-compose.yml",
-            "podman-compose.yaml",
-            "podman-compose.yml",
-        ];
+        return parse_compose(file, options, &path.display().to_string());
+    }
 
-        if !io::stdin().is_terminal() {
-            return read_from_stdin(options);
+    if !io::stdin().is_terminal() {
+        return read_from_stdin(options);
+    }
+
+    const FILE_NAMES: [&str; 6] = [
+        "compose.yaml",
+        "compose.yml",
+        "docker-compose.yaml",
+        "docker-compose.yml",
+        "podman-compose.yaml",
+        "podman-compose.yml",
+    ];
+
+    for file_name in FILE_NAMES {
+        if let Ok(file) = fs::File::open(file_name) {
+            return parse_compose(file, options, file_name);
         }
+    }
 
-        let mut result = None;
-        for file_name in FILE_NAMES {
-            if let Ok(compose_file) = fs::File::open(file_name) {
-                result = Some((compose_file, file_name.as_ref()));
-                break;
-            }
-        }
+    Err(eyre!(
+        "a compose file was not provided and none of \
+            `compose.yaml`, `compose.yml`, `docker-compose.yaml`, `docker-compose.yml`, \
+            `podman-compose.yaml`, or `podman-compose.yml` exist in the current directory or \
+            could not be read"
+    ))
+}
 
-        result.ok_or_eyre(
-            "a compose file was not provided and none of \
-                `compose.yaml`, `compose.yml`, `docker-compose.yaml`, `docker-compose.yml`, \
-                `podman-compose.yaml`, or `podman-compose.yml` exist in the current directory or \
-                could not be read",
-        )?
-    };
+/// Parse a compose file from `reader`, extracting lifecycle hooks before deserialization.
+///
+/// `source` is used only for error messages (e.g. a file path or `"stdin"`).
+///
+/// # Errors
+///
+/// Returns an error if the reader does not contain valid YAML or a valid compose file.
+fn parse_compose(
+    reader: impl io::Read,
+    options: &Options,
+    source: &str,
+) -> color_eyre::Result<(compose_spec::Compose, HashMap<String, LifecycleHooks>)> {
+    let mut value: serde_yaml::Value = serde_yaml::from_reader(reader)
+        .wrap_err_with(|| format!("`{source}` is not valid YAML"))?;
 
-    options
-        .from_yaml_reader(compose_file)
-        .wrap_err_with(|| format!("File `{}` is not a valid compose file", path.display()))
+    let hooks = extract_lifecycle_hooks(&mut value)?;
+
+    let compose = options
+        .from_yaml_value(value)
+        .wrap_err_with(|| format!("`{source}` is not a valid compose file"))?;
+
+    Ok((compose, hooks))
 }
 
 /// Read and deserialize [`compose_spec::Compose`] from stdin.
@@ -226,15 +378,15 @@ fn read_from_file_or_stdin(
 /// # Errors
 ///
 /// Returns an error if stdin is a terminal or there was an error deserializing.
-fn read_from_stdin(options: &Options) -> color_eyre::Result<compose_spec::Compose> {
+fn read_from_stdin(
+    options: &Options,
+) -> color_eyre::Result<(compose_spec::Compose, HashMap<String, LifecycleHooks>)> {
     let stdin = io::stdin();
     if stdin.is_terminal() {
         bail!("cannot read compose from stdin, stdin is a terminal");
     }
 
-    options
-        .from_yaml_reader(stdin)
-        .wrap_err("data from stdin is not a valid compose file")
+    parse_compose(stdin, options, "stdin")
 }
 
 /// Attempt to convert [`Service`]s, [`Networks`], and [`Volumes`] into [`File`]s.
@@ -249,6 +401,7 @@ fn parts_try_into_files(
     volumes: Volumes,
     pod_name: Option<String>,
     sections: GenericSections,
+    lifecycle_hooks: &HashMap<String, LifecycleHooks>,
 ) -> color_eyre::Result<Vec<File>> {
     // Get a map of volumes to whether the volume has options associated with it for use in
     // converting a service into a Quadlet file. Extra volume options must be specified in a
@@ -271,6 +424,7 @@ fn parts_try_into_files(
         &volume_has_options,
         pod_name.as_deref(),
         &mut pod_ports,
+        lifecycle_hooks,
     )?;
 
     let mut files: Vec<File> = service_files.into_iter().map(File::from).collect();
@@ -349,6 +503,7 @@ fn services_try_into_quadlet_files(
     volume_has_options: &HashMap<Identifier, bool>,
     pod_name: Option<&str>,
     pod_ports: &mut Vec<String>,
+    lifecycle_hooks: &HashMap<String, LifecycleHooks>,
 ) -> color_eyre::Result<(Vec<quadlet::File>, HashSet<String>)> {
     let mut files = Vec::new();
     let mut healthy_dependencies = HashSet::new();
@@ -389,6 +544,7 @@ fn services_try_into_quadlet_files(
             volume_has_options,
             pod_name,
             pod_ports,
+            lifecycle_hooks,
         )?;
         files.push(file);
         healthy_dependencies.extend(healthy);
@@ -425,6 +581,7 @@ fn service_try_into_quadlet_file(
     volume_has_options: &HashMap<Identifier, bool>,
     pod_name: Option<&str>,
     pod_ports: &mut Vec<String>,
+    lifecycle_hooks: &HashMap<String, LifecycleHooks>,
 ) -> color_eyre::Result<(quadlet::File, HashSet<String>)> {
     let mut healthy_dependencies = HashSet::new();
 
@@ -470,6 +627,22 @@ fn service_try_into_quadlet_file(
         }
     }
 
+    let mut service = restart
+        .map(quadlet::Service::from)
+        .unwrap_or_default();
+
+    if let Some(hooks) = lifecycle_hooks.get(name.as_str()) {
+        let container_name = container
+            .container_name
+            .as_deref()
+            .unwrap_or("systemd-%N");
+        let (exec_start_post, exec_stop) = hooks
+            .to_service_fields(container_name)
+            .wrap_err_with(|| format!("error converting lifecycle hooks for service `{name}`"))?;
+        service.exec_start_post = exec_start_post;
+        service.exec_stop = exec_stop;
+    }
+
     let name = if let Some(pod_name) = pod_name {
         container.pod = Some(format!("{pod_name}.pod"));
         pod_ports.extend(mem::take(&mut container.publish_port));
@@ -485,7 +658,7 @@ fn service_try_into_quadlet_file(
             resource: container.into(),
             globals: global_args.into(),
             quadlet,
-            service: restart.map(Into::into).unwrap_or_default(),
+            service,
             install,
         },
         healthy_dependencies,
@@ -569,4 +742,243 @@ fn volumes_try_into_quadlet_files(
             }
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_hooks_post_start_and_pre_stop() {
+        let yaml = r#"
+services:
+  app:
+    image: example
+    post_start:
+      - command: ["pg_isready", "-U", "postgres"]
+    pre_stop:
+      - command: ["pg_ctl", "stop", "-m", "fast"]
+"#;
+        let mut value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let hooks = extract_lifecycle_hooks(&mut value).unwrap();
+        let app_hooks = hooks.get("app").unwrap();
+        assert_eq!(
+            app_hooks.post_start[0].command,
+            vec!["pg_isready", "-U", "postgres"]
+        );
+        assert_eq!(
+            app_hooks.pre_stop[0].command,
+            vec!["pg_ctl", "stop", "-m", "fast"]
+        );
+    }
+
+    #[test]
+    fn extract_hooks_removes_keys_from_value() {
+        let yaml = r#"
+services:
+  app:
+    image: example
+    post_start:
+      - command: ["echo", "hi"]
+"#;
+        let mut value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        extract_lifecycle_hooks(&mut value).unwrap();
+        // post_start key should be gone so compose_spec won't choke on it
+        let svc = &value["services"]["app"];
+        assert!(svc.get("post_start").is_none());
+    }
+
+    #[test]
+    fn extract_hooks_malformed_returns_error() {
+        let yaml = r#"
+services:
+  app:
+    image: example
+    post_start: "not-a-list"
+"#;
+        let mut value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        assert!(extract_lifecycle_hooks(&mut value).is_err());
+    }
+
+    #[test]
+    fn to_service_fields_formats_with_systemd_specifier() {
+        let hooks = LifecycleHooks {
+            post_start: vec![HookEntry {
+                command: vec!["pg_isready".into(), "-U".into(), "postgres".into()],
+                ..Default::default()
+            }],
+            pre_stop: vec![HookEntry {
+                command: vec!["pg_ctl".into(), "stop".into(), "-m".into(), "fast".into()],
+                ..Default::default()
+            }],
+        };
+        let (start_post, stop) = hooks.to_service_fields("systemd-%N").unwrap();
+        assert_eq!(
+            start_post,
+            vec!["podman exec 'systemd-%N' pg_isready -U postgres"]
+        );
+        assert_eq!(stop, vec!["podman exec 'systemd-%N' pg_ctl stop -m fast"]);
+    }
+
+    #[test]
+    fn extract_hooks_multiple_entries_all_collected() {
+        let yaml = r#"
+services:
+  app:
+    image: example
+    post_start:
+      - command: ["step1"]
+      - command: ["step2", "--flag"]
+    pre_stop:
+      - command: ["cleanup1"]
+      - command: ["cleanup2", "--force"]
+"#;
+        let mut value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let hooks = extract_lifecycle_hooks(&mut value).unwrap();
+        let app_hooks = hooks.get("app").unwrap();
+        assert_eq!(app_hooks.post_start.len(), 2);
+        assert_eq!(app_hooks.post_start[0].command, vec!["step1"]);
+        assert_eq!(app_hooks.post_start[1].command, vec!["step2", "--flag"]);
+        assert_eq!(app_hooks.pre_stop.len(), 2);
+        assert_eq!(app_hooks.pre_stop[0].command, vec!["cleanup1"]);
+        assert_eq!(app_hooks.pre_stop[1].command, vec!["cleanup2", "--force"]);
+    }
+
+    #[test]
+    fn extract_hooks_no_services_key_returns_empty() {
+        let yaml = r#"
+version: "3"
+networks:
+  default:
+"#;
+        let mut value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let hooks = extract_lifecycle_hooks(&mut value).unwrap();
+        assert!(hooks.is_empty());
+    }
+
+    #[test]
+    fn to_service_fields_quotes_args_with_spaces_and_special_chars() {
+        let hooks = LifecycleHooks {
+            post_start: vec![HookEntry {
+                command: vec!["echo".into(), "hello world".into(), "it's alive".into()],
+                ..Default::default()
+            }],
+            pre_stop: vec![],
+        };
+        let (start_post, _stop) = hooks.to_service_fields("systemd-%N").unwrap();
+        // shlex quotes args with spaces and uses double-quotes when the arg contains an apostrophe
+        assert_eq!(
+            start_post,
+            vec!["podman exec 'systemd-%N' echo 'hello world' \"it's alive\""]
+        );
+    }
+
+    #[test]
+    fn to_service_fields_with_user() {
+        let hooks = LifecycleHooks {
+            post_start: vec![HookEntry {
+                command: vec!["whoami".into()],
+                user: Some("postgres".into()),
+                ..Default::default()
+            }],
+            pre_stop: vec![],
+        };
+        let (start_post, _) = hooks.to_service_fields("mycontainer").unwrap();
+        assert_eq!(
+            start_post,
+            vec!["podman exec --user postgres mycontainer whoami"]
+        );
+    }
+
+    #[test]
+    fn to_service_fields_with_privileged() {
+        let hooks = LifecycleHooks {
+            post_start: vec![HookEntry {
+                command: vec!["id".into()],
+                privileged: true,
+                ..Default::default()
+            }],
+            pre_stop: vec![],
+        };
+        let (start_post, _) = hooks.to_service_fields("mycontainer").unwrap();
+        assert_eq!(
+            start_post,
+            vec!["podman exec --privileged mycontainer id"]
+        );
+    }
+
+    #[test]
+    fn to_service_fields_with_working_dir() {
+        let hooks = LifecycleHooks {
+            post_start: vec![HookEntry {
+                command: vec!["ls".into()],
+                working_dir: Some("/app".into()),
+                ..Default::default()
+            }],
+            pre_stop: vec![],
+        };
+        let (start_post, _) = hooks.to_service_fields("mycontainer").unwrap();
+        assert_eq!(
+            start_post,
+            vec!["podman exec --workdir /app mycontainer ls"]
+        );
+    }
+
+    #[test]
+    fn to_service_fields_with_environment_list() {
+        let hooks = LifecycleHooks {
+            post_start: vec![HookEntry {
+                command: vec!["env".into()],
+                environment: Some(HookEnvironment::List(vec!["FOO=bar".into(), "BAZ=qux".into()])),
+                ..Default::default()
+            }],
+            pre_stop: vec![],
+        };
+        let (start_post, _) = hooks.to_service_fields("mycontainer").unwrap();
+        assert_eq!(
+            start_post,
+            vec!["podman exec --env 'FOO=bar' --env 'BAZ=qux' mycontainer env"]
+        );
+    }
+
+    #[test]
+    fn to_service_fields_with_environment_map() {
+        let mut map = IndexMap::new();
+        map.insert("FOO".to_string(), Some("bar".to_string()));
+        map.insert("NO_VAL".to_string(), None);
+        let hooks = LifecycleHooks {
+            post_start: vec![HookEntry {
+                command: vec!["env".into()],
+                environment: Some(HookEnvironment::Map(map)),
+                ..Default::default()
+            }],
+            pre_stop: vec![],
+        };
+        let (start_post, _) = hooks.to_service_fields("mycontainer").unwrap();
+        assert_eq!(
+            start_post,
+            vec!["podman exec --env 'FOO=bar' --env NO_VAL mycontainer env"]
+        );
+    }
+
+    #[test]
+    fn to_service_fields_with_all_fields() {
+        let mut map = IndexMap::new();
+        map.insert("DEBUG".to_string(), Some("1".to_string()));
+        let hooks = LifecycleHooks {
+            post_start: vec![HookEntry {
+                command: vec!["app".into(), "--check".into()],
+                user: Some("appuser".into()),
+                privileged: true,
+                working_dir: Some("/workspace".into()),
+                environment: Some(HookEnvironment::Map(map)),
+            }],
+            pre_stop: vec![],
+        };
+        let (start_post, _) = hooks.to_service_fields("mycontainer").unwrap();
+        assert_eq!(
+            start_post,
+            vec!["podman exec --user appuser --privileged --workdir /workspace --env 'DEBUG=1' mycontainer app --check"]
+        );
+    }
 }
