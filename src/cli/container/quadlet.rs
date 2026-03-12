@@ -280,7 +280,7 @@ pub struct QuadletOptions {
     ///
     /// Can be specified multiple times
     #[arg(short, long, value_name = "KEY=VALUE")]
-    label: Vec<String>,
+    pub(super) label: Vec<String>,
 
     /// Logging driver for the container
     ///

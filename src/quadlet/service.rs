@@ -22,6 +22,11 @@ pub struct Service {
     #[arg(skip)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub exec_stop: Vec<String>,
+
+    /// Maximum number of times to attempt to restart the service.
+    #[arg(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_limit_burst: Option<u64>,
 }
 
 impl Service {
@@ -31,9 +36,13 @@ impl Service {
             restart,
             exec_start_post,
             exec_stop,
+            start_limit_burst,
         } = self;
 
-        restart.is_none() && exec_start_post.is_empty() && exec_stop.is_empty()
+        restart.is_none()
+            && exec_start_post.is_empty()
+            && exec_stop.is_empty()
+            && start_limit_burst.is_none()
     }
 }
 

@@ -103,6 +103,26 @@ impl LifecycleHooks {
     }
 }
 
+/// Strip `update_config` and `rollback_config` from each service's `deploy` block.
+///
+/// These are swarm-only fields that `compose_spec` v0.3.0 may fail to deserialize
+/// (e.g. `failure_action: rollback`). We drop them silently before deserialization.
+fn strip_swarm_deploy_fields(value: &mut serde_yaml::Value) {
+    let Some(serde_yaml::Value::Mapping(services)) = value.get_mut("services") else {
+        return;
+    };
+    for (_name, service) in services.iter_mut() {
+        let Some(service_map) = service.as_mapping_mut() else {
+            continue;
+        };
+        let deploy_key = serde_yaml::Value::String("deploy".into());
+        if let Some(serde_yaml::Value::Mapping(deploy_map)) = service_map.get_mut(&deploy_key) {
+            deploy_map.remove(serde_yaml::Value::String("update_config".into()));
+            deploy_map.remove(serde_yaml::Value::String("rollback_config".into()));
+        }
+    }
+}
+
 /// Extract `post_start` and `pre_stop` lifecycle hooks from the YAML value.
 ///
 /// These keys are not recognized by `compose_spec` v0.3.0 and must be removed before
@@ -312,6 +332,15 @@ fn read_from_file_or_stdin(
     path: Option<&Path>,
     options: &Options,
 ) -> color_eyre::Result<(compose_spec::Compose, HashMap<String, LifecycleHooks>)> {
+    const FILE_NAMES: [&str; 6] = [
+        "compose.yaml",
+        "compose.yml",
+        "docker-compose.yaml",
+        "docker-compose.yml",
+        "podman-compose.yaml",
+        "podman-compose.yml",
+    ];
+
     if let Some(path) = path {
         if path.as_os_str() == "-" {
             return read_from_stdin(options);
@@ -325,15 +354,6 @@ fn read_from_file_or_stdin(
     if !io::stdin().is_terminal() {
         return read_from_stdin(options);
     }
-
-    const FILE_NAMES: [&str; 6] = [
-        "compose.yaml",
-        "compose.yml",
-        "docker-compose.yaml",
-        "docker-compose.yml",
-        "podman-compose.yaml",
-        "podman-compose.yml",
-    ];
 
     for file_name in FILE_NAMES {
         if let Ok(file) = fs::File::open(file_name) {
@@ -365,6 +385,7 @@ fn parse_compose(
         .wrap_err_with(|| format!("`{source}` is not valid YAML"))?;
 
     let hooks = extract_lifecycle_hooks(&mut value)?;
+    strip_swarm_deploy_fields(&mut value);
 
     let compose = options
         .from_yaml_value(value)
@@ -607,6 +628,10 @@ fn service_try_into_quadlet_file(
     let global_args = GlobalArgs::from_compose(&mut service);
 
     let restart = service.restart;
+    let deploy_restart_policy = service
+        .deploy
+        .as_ref()
+        .and_then(|d| d.restart_policy.clone());
 
     let mut container = Container::try_from(service)
         .map(quadlet::Container::from)
@@ -627,9 +652,11 @@ fn service_try_into_quadlet_file(
         }
     }
 
-    let mut service = restart
-        .map(quadlet::Service::from)
-        .unwrap_or_default();
+    let mut service = match (restart, deploy_restart_policy) {
+        (Some(r), _) => quadlet::Service::from(r),
+        (None, Some(rp)) => service_from_deploy_restart_policy(&rp),
+        (None, None) => quadlet::Service::default(),
+    };
 
     if let Some(hooks) = lifecycle_hooks.get(name.as_str()) {
         let container_name = container
@@ -663,6 +690,27 @@ fn service_try_into_quadlet_file(
         },
         healthy_dependencies,
     ))
+}
+
+/// Convert a compose [`RestartPolicy`](compose_spec::service::deploy::RestartPolicy) to a
+/// [`quadlet::Service`].
+fn service_from_deploy_restart_policy(
+    rp: &compose_spec::service::deploy::RestartPolicy,
+) -> quadlet::Service {
+    use compose_spec::service::deploy::RestartCondition;
+    use crate::quadlet::service::RestartConfig;
+
+    let restart = rp.condition.map(|c| match c {
+        RestartCondition::None => RestartConfig::No,
+        RestartCondition::OnFailure => RestartConfig::OnFailure,
+        RestartCondition::Any => RestartConfig::Always,
+    });
+
+    quadlet::Service {
+        restart,
+        start_limit_burst: rp.max_attempts,
+        ..quadlet::Service::default()
+    }
 }
 
 /// Attempt to convert compose [`Networks`] into an [`Iterator`] of [`quadlet::File`]s.
@@ -980,5 +1028,80 @@ networks:
             start_post,
             vec!["podman exec --user appuser --privileged --workdir /workspace --env 'DEBUG=1' mycontainer app --check"]
         );
+    }
+
+    #[test]
+    fn restart_policy_any_maps_to_always() {
+        use compose_spec::service::deploy::{RestartCondition, RestartPolicy};
+        use crate::quadlet::service::RestartConfig;
+        let rp = RestartPolicy {
+            condition: Some(RestartCondition::Any),
+            max_attempts: None,
+            ..RestartPolicy::default()
+        };
+        let service = service_from_deploy_restart_policy(&rp);
+        assert_eq!(service.restart, Some(RestartConfig::Always));
+    }
+
+    #[test]
+    fn restart_policy_max_attempts_sets_start_limit_burst() {
+        use compose_spec::service::deploy::{RestartCondition, RestartPolicy};
+        let rp = RestartPolicy {
+            condition: Some(RestartCondition::OnFailure),
+            max_attempts: Some(5),
+            ..RestartPolicy::default()
+        };
+        let service = service_from_deploy_restart_policy(&rp);
+        assert_eq!(service.start_limit_burst, Some(5));
+    }
+
+    #[test]
+    fn update_config_failure_action_rollback_is_accepted() {
+        // strip_swarm_deploy_fields removes update_config before deserialization,
+        // so failure_action: rollback (not in compose_spec's FailureAction enum) is handled.
+        let yaml = r#"
+services:
+  app:
+    image: example
+    deploy:
+      update_config:
+        failure_action: rollback
+"#;
+        let mut value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        strip_swarm_deploy_fields(&mut value);
+        // After stripping, update_config should be gone
+        let deploy = &value["services"]["app"].get("deploy");
+        if let Some(serde_yaml::Value::Mapping(deploy_map)) = deploy {
+            assert!(
+                !deploy_map.contains_key(&serde_yaml::Value::String("update_config".into())),
+                "update_config should have been stripped",
+            );
+        }
+        // And deserialization should succeed
+        let options = Options::default();
+        let result = options.from_yaml_value(value);
+        assert!(result.is_ok(), "compose deserialization should succeed: {:?}", result.err());
+    }
+
+    #[test]
+    fn rollback_config_is_stripped() {
+        let yaml = r#"
+services:
+  app:
+    image: example
+    deploy:
+      rollback_config:
+        failure_action: rollback
+"#;
+        let mut value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        strip_swarm_deploy_fields(&mut value);
+        if let Some(serde_yaml::Value::Mapping(deploy_map)) =
+            value["services"]["app"].get("deploy")
+        {
+            assert!(
+                !deploy_map.contains_key(&serde_yaml::Value::String("rollback_config".into())),
+                "rollback_config should have been stripped",
+            );
+        }
     }
 }

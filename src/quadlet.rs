@@ -6,7 +6,7 @@ mod install;
 pub mod kube;
 mod network;
 mod pod;
-mod service;
+pub mod service;
 mod unit;
 mod volume;
 

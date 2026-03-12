@@ -86,6 +86,9 @@ impl TryFrom<compose_spec::Service> for Container {
             memory,
             pids_limit,
             cpus,
+            memory_reservation,
+            cpu_shares,
+            labels: deploy_labels,
         } = deploy
             .map(deploy_into_resources)
             .transpose()?
@@ -113,10 +116,17 @@ impl TryFrom<compose_spec::Service> for Container {
         if quadlet_options.pids_limit.is_none() {
             quadlet_options.pids_limit = pids_limit;
         }
+        quadlet_options.label.extend(deploy_labels);
 
         let mut podman_args: PodmanArgs = podman_args.try_into()?;
         if podman_args.cpus.is_none() {
             podman_args.cpus = cpus;
+        }
+        if podman_args.memory_reservation.is_none() {
+            podman_args.memory_reservation = memory_reservation;
+        }
+        if podman_args.cpu_shares.is_none() {
+            podman_args.cpu_shares = cpu_shares;
         }
 
         Ok(Self {
@@ -139,40 +149,46 @@ struct DeployResources {
     memory: Option<String>,
     pids_limit: Option<Limit<u32>>,
     cpus: Option<f64>,
+    memory_reservation: Option<String>,
+    cpu_shares: Option<u64>,
+    labels: Vec<String>,
 }
 
 /// Extract resources from [`compose_spec::service::Deploy`] and convert them to quadlet/podman
 /// fields. Unsupported deploy fields cause an error.
+#[allow(clippy::too_many_lines)]
 fn deploy_into_resources(
     deploy: compose_spec::service::Deploy,
 ) -> color_eyre::Result<DeployResources> {
     use color_eyre::eyre::ensure;
 
     let compose_spec::service::Deploy {
-        endpoint_mode,
+        endpoint_mode: _,
         labels,
-        mode,
-        placement,
-        replicas,
+        mode: _,
+        placement: _,
+        replicas: _,
         resources,
-        restart_policy,
-        rollback_config,
-        update_config,
+        restart_policy: _,
+        rollback_config: _,
+        update_config: _,
         extensions,
     } = deploy;
 
-    ensure!(endpoint_mode.is_none(), "`deploy.endpoint_mode` is not supported");
-    ensure!(labels.is_empty(), "`deploy.labels` is not supported");
-    ensure!(mode.is_none(), "`deploy.mode` is not supported");
-    ensure!(placement.is_none(), "`deploy.placement` is not supported");
-    ensure!(replicas.is_none(), "`deploy.replicas` is not supported");
-    ensure!(restart_policy.is_none(), "`deploy.restart_policy` is not supported");
-    ensure!(rollback_config.is_none(), "`deploy.rollback_config` is not supported");
-    ensure!(update_config.is_none(), "`deploy.update_config` is not supported");
     ensure!(extensions.is_empty(), "compose extensions are not supported");
 
+    let deploy_labels: Vec<String> = labels.into_list().into_iter().collect();
+
     let Some(resources) = resources else {
-        return Ok(DeployResources::default());
+        return Ok(DeployResources {
+            devices: Vec::new(),
+            memory: None,
+            pids_limit: None,
+            cpus: None,
+            memory_reservation: None,
+            cpu_shares: None,
+            labels: deploy_labels,
+        });
     };
 
     let compose_spec::service::deploy::Resources {
@@ -206,16 +222,20 @@ fn deploy_into_resources(
             memory: result_memory,
             pids_limit: result_pids_limit,
             cpus: result_cpus,
+            memory_reservation: None,
+            cpu_shares: None,
+            labels: deploy_labels,
         });
     };
 
     let compose_spec::service::deploy::resources::Reservations {
-        cpus: _,
-        memory: _,
+        cpus: reservations_cpus,
+        memory: reservations_memory,
         devices,
         generic_resources,
         extensions,
     } = reservations;
+    let result_memory_reservation = reservations_memory.map(|m| m.to_string());
     ensure!(
         generic_resources.is_empty(),
         "`deploy.resources.reservations.generic_resources` is not supported"
@@ -268,11 +288,18 @@ fn deploy_into_resources(
         }
     }
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let result_cpu_shares =
+        reservations_cpus.map(|c| (f64::from(c) * 1024.0).round() as u64);
+
     Ok(DeployResources {
         devices: result,
         memory: result_memory,
         pids_limit: result_pids_limit,
         cpus: result_cpus,
+        memory_reservation: result_memory_reservation,
+        cpu_shares: result_cpu_shares,
+        labels: deploy_labels,
     })
 }
 
@@ -339,6 +366,54 @@ impl From<Container> for crate::quadlet::Resource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod deploy {
+        use super::*;
+
+        fn container_from_yaml(yaml: &str) -> color_eyre::Result<Container> {
+            let service: compose_spec::Service = serde_yaml::from_str(yaml).unwrap();
+            Container::try_from(service)
+        }
+
+        #[test]
+        fn reservations_memory_becomes_memory_reservation() {
+            let container = container_from_yaml(
+                "image: test\ndeploy:\n  resources:\n    reservations:\n      memory: 256m\n",
+            )
+            .unwrap();
+            assert_eq!(
+                container.podman_args.memory_reservation.as_deref(),
+                Some("256mb"),
+                "reservations.memory should map to --memory-reservation",
+            );
+        }
+
+        #[test]
+        fn reservations_cpus_becomes_cpu_shares() {
+            let container = container_from_yaml(
+                "image: test\ndeploy:\n  resources:\n    reservations:\n      cpus: 2.0\n",
+            )
+            .unwrap();
+            assert_eq!(
+                container.podman_args.cpu_shares,
+                Some(2048),
+                "reservations.cpus should map to --cpu-shares (cpus * 1024)",
+            );
+        }
+
+        #[test]
+        fn deploy_labels_extend_container_labels() {
+            let container = container_from_yaml(
+                "image: test\ndeploy:\n  labels:\n    - foo=bar\n",
+            )
+            .unwrap();
+            assert!(
+                container.quadlet_options.label.contains(&"foo=bar".to_owned()),
+                "deploy.labels should extend container labels",
+            );
+        }
+
+    }
 
     mod name {
         use super::*;

@@ -96,7 +96,7 @@ pub struct PodmanArgs {
 
     /// CPU shares (relative weight)
     #[arg(short, long, value_name = "SHARES")]
-    cpu_shares: Option<u64>,
+    pub(super) cpu_shares: Option<u64>,
 
     /// Number of CPUs
     #[arg(long, value_name = "NUMBER")]
@@ -221,7 +221,7 @@ pub struct PodmanArgs {
 
     /// Memory soft limit
     #[arg(long, value_name = "NUMBER[UNIT]")]
-    memory_reservation: Option<String>,
+    pub(super) memory_reservation: Option<String>,
 
     /// Limit value equal to memory plus swap
     #[arg(long, allow_negative_numbers = true, value_name = "NUMBER[UNIT]")]
